@@ -28,7 +28,7 @@ rust.unexpected_cfgs = { level = "warn", check-cfg = [
 clippy = { needless_lifetimes = "allow" }
 
 [features]
-default = ["dim2", "f32"]
+default = ["dim2", "f32", "enhanced-determinism"]
 dim2 = []
 f32 = []
 parallel = ["dep:rayon"]
