@@ -33,6 +33,12 @@ pub(crate) fn point_key(point: Point<Real>, region_width: Real) -> Point<RegionK
         .coords
         .map(|e| {
             // If the region is outside this range, the region keys will overlap
+            if e.floor() > RegionKey::MAX as Real {
+                panic!(
+                "failed assertion `e.floor() < RegionKey::MAX as Real`. Backtrace:\n-----\n\n{:?}",
+                std::backtrace::Backtrace::force_capture()
+            )
+            }
             assert!(e.floor() < RegionKey::MAX as Real);
             assert!(e.floor() > RegionKey::MIN as Real);
             e.floor() as RegionKey
