@@ -22,6 +22,7 @@ use crate::prelude::{CollisionEventFlags, MultibodyJointSet};
 use parry::query::{DefaultQueryDispatcher, PersistentQueryDispatcher};
 use parry::utils::IsometryOpt;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
@@ -59,6 +60,17 @@ pub struct NarrowPhase {
     contact_graph: InteractionGraph<ColliderHandle, ContactPair>,
     intersection_graph: InteractionGraph<ColliderHandle, IntersectionPair>,
     graph_indices: Coarena<ColliderGraphIndices>,
+}
+
+// NOTE: We skip `query_dispatcher` in the debug output because it is also skipped in the serialization
+impl Debug for NarrowPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NarrowPhase[[INCOMPLETE]]")
+            .field("contact_graph", &self.contact_graph)
+            .field("intersection_graph", &self.intersection_graph)
+            .field("graph_indices", &self.graph_indices)
+            .finish()
+    }
 }
 
 pub(crate) type ContactManifoldIndex = usize;

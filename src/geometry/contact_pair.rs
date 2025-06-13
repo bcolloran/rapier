@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use crate::dynamics::{RigidBodyHandle, RigidBodySet};
 use crate::geometry::{ColliderHandle, ColliderSet, Contact, ContactManifold};
 use crate::math::{Point, Real, TangentImpulse, Vector};
@@ -128,6 +130,19 @@ pub struct ContactPair {
     /// Was a `CollisionEvent::Started` emitted for this collider?
     pub(crate) start_event_emitted: bool,
     pub(crate) workspace: Option<ContactManifoldsWorkspace>,
+}
+
+impl Debug for ContactPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContactPair[[INCOMPLETE]]")
+            .field("collider1", &self.collider1)
+            .field("collider2", &self.collider2)
+            .field("manifolds", &self.manifolds)
+            .field("has_any_active_contact", &self.has_any_active_contact)
+            .field("start_event_emitted", &self.start_event_emitted)
+            .field("workspace", &"[[OMITTED]]")
+            .finish()
+    }
 }
 
 impl ContactPair {
