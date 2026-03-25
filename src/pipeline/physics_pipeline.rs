@@ -816,7 +816,6 @@ impl PhysicsPipeline {
     /// Using this step function will result in the collision data structures (contact pairs, manifolds, etc.) being up-to-date immediately after integration, which can be useful for certain use cases.
     pub fn step_collisions_last(
         &mut self,
-        mut modified_colliders: ModifiedColliders,
         gravity: &Vector<Real>,
         integration_parameters: &IntegrationParameters,
         islands: &mut IslandManager,
@@ -824,6 +823,7 @@ impl PhysicsPipeline {
         narrow_phase: &mut NarrowPhase,
         bodies: &mut RigidBodySet,
         colliders: &mut ColliderSet,
+        modified_colliders: &mut ModifiedColliders,
         impulse_joints: &mut ImpulseJointSet,
         multibody_joints: &mut MultibodyJointSet,
         ccd_solver: &mut CCDSolver,
@@ -833,7 +833,7 @@ impl PhysicsPipeline {
         self.counters.reset();
         self.counters.step_started();
         self.step_integration_phase(
-            &mut modified_colliders,
+            modified_colliders,
             gravity,
             integration_parameters,
             islands,
@@ -849,6 +849,7 @@ impl PhysicsPipeline {
         );
 
         // Re-insert the modified vector we extracted for the borrow-checker.
+        let modified_colliders = std::mem::take(modified_colliders);
         colliders.set_modified(modified_colliders);
 
         let modified_colliders = self.step_collision_detection_phase(
