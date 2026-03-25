@@ -1019,7 +1019,7 @@ impl PhysicsPipeline {
     /// Runs the integration phase of the physics pipeline.
     pub fn step_integration_phase(
         &mut self,
-        mut modified_colliders: &mut ModifiedObjects<ColliderHandle, Collider>,
+        modified_colliders: &mut ModifiedObjects<ColliderHandle, Collider>,
         gravity: &Vector<Real>,
         integration_parameters: &IntegrationParameters,
         islands: &mut IslandManager,
@@ -1143,7 +1143,7 @@ impl PhysicsPipeline {
             }
 
             self.counters.stages.update_time.resume();
-            self.advance_to_final_positions(islands, bodies, colliders, &mut modified_colliders);
+            self.advance_to_final_positions(islands, bodies, colliders, modified_colliders);
             self.counters.stages.update_time.pause();
 
             if remaining_substeps > 0 {
@@ -1163,7 +1163,7 @@ impl PhysicsPipeline {
                     false,
                 );
 
-                self.clear_modified_colliders(colliders, &mut modified_colliders);
+                self.clear_modified_colliders(colliders, modified_colliders);
             } else {
                 // If we ran the last substep, just update the broad-phase bvh instead
                 // of a full collision-detection step.
