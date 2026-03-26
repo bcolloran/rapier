@@ -425,21 +425,13 @@ impl PhysicsPipeline {
         }
     }
 
-
     pub fn user_changes_stage_part_1(
         &mut self,
-        // gravity: &Vector<Real>,
-        // integration_parameters: &IntegrationParameters,
         islands: &mut IslandManager,
-        // broad_phase: &mut BroadPhaseBvh,
-        // narrow_phase: &mut NarrowPhase,
         bodies: &mut RigidBodySet,
         colliders: &mut ColliderSet,
         impulse_joints: &mut ImpulseJointSet,
         multibody_joints: &mut MultibodyJointSet,
-        // ccd_solver: &mut CCDSolver,
-        // hooks: &dyn PhysicsHooks,
-        // events: &dyn EventHandler,
     ) -> (
         ModifiedObjects<ColliderHandle, Collider>,
         Vec<ColliderHandle>,
@@ -802,7 +794,6 @@ impl PhysicsPipeline {
     /// This function must be run once before the first call to `step_collisions_last_more_granular`
     pub fn initialize_for_step_collisions_last(
         &mut self,
-        // gravity: &Vector<Real>,
         integration_parameters: &IntegrationParameters,
         islands: &mut IslandManager,
         broad_phase: &mut BroadPhaseBvh,
@@ -811,12 +802,8 @@ impl PhysicsPipeline {
         colliders: &mut ColliderSet,
         impulse_joints: &mut ImpulseJointSet,
         multibody_joints: &mut MultibodyJointSet,
-        // ccd_solver: &mut CCDSolver,
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
-        // mut modified_colliders: ModifiedObjects<ColliderHandle, Collider>,
-        // mut removed_colliders: Vec<ColliderHandle>,
-        // mut modified_bodies: ModifiedObjects<RigidBodyHandle, RigidBody>,
     ) -> (
         ModifiedObjects<ColliderHandle, Collider>,
         Vec<ColliderHandle>,
@@ -967,7 +954,11 @@ impl PhysicsPipeline {
 
         self.counters.step_completed();
 
-        (user_modified_colliders, user_removed_colliders, user_modified_bodies)
+        (
+            user_modified_colliders,
+            user_removed_colliders,
+            user_modified_bodies,
+        )
     }
 }
 
