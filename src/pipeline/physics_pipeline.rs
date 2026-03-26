@@ -16,7 +16,7 @@ use crate::geometry::{
 };
 use crate::math::{Real, Vector};
 use crate::pipeline::{EventHandler, PhysicsHooks};
-use crate::prelude::{Collider, ModifiedRigidBodies};
+use crate::prelude::{Collider, ModifiedRigidBodies, RigidBody, RigidBodyHandle};
 use {crate::dynamics::RigidBodySet, crate::geometry::ColliderSet};
 
 /// The main physics simulation engine that runs your physics world forward in time.
@@ -475,288 +475,291 @@ impl PhysicsPipeline {
     ///     &(),  // No event handler
     /// );
     /// ```
-    // pub fn step(
-    //     &mut self,
-    //     gravity: &Vector<Real>,
-    //     integration_parameters: &IntegrationParameters,
-    //     islands: &mut IslandManager,
-    //     broad_phase: &mut BroadPhaseBvh,
-    //     narrow_phase: &mut NarrowPhase,
-    //     bodies: &mut RigidBodySet,
-    //     colliders: &mut ColliderSet,
-    //     impulse_joints: &mut ImpulseJointSet,
-    //     multibody_joints: &mut MultibodyJointSet,
-    //     ccd_solver: &mut CCDSolver,
-    //     hooks: &dyn PhysicsHooks,
-    //     events: &dyn EventHandler,
-    // ) {
-    //     self.counters.reset();
-    //     self.counters.step_started();
+    ///
+    /// THIS IS THE OLD VERSION OF THE fn from the rapier repo, just kept for reference while we are working on the new one. It will be removed once the new version is fully implemented and tested.
+    fn old_step(
+        &mut self,
+        gravity: &Vector<Real>,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.counters.reset();
+        self.counters.step_started();
 
-    //     // Apply some of delayed wake-ups.
-    //     self.counters.stages.user_changes.start();
-    //     #[cfg(feature = "enhanced-determinism")]
-    //     let impulse_joints_iterator = impulse_joints
-    //         .to_wake_up
-    //         .drain(..)
-    //         .chain(multibody_joints.to_wake_up.drain(..));
-    //     #[cfg(not(feature = "enhanced-determinism"))]
-    //     let impulse_joints_iterator = impulse_joints
-    //         .to_wake_up
-    //         .drain()
-    //         .chain(multibody_joints.to_wake_up.drain());
-    //     for handle in impulse_joints_iterator {
-    //         islands.wake_up(bodies, handle, true);
-    //     }
+        // Apply some of delayed wake-ups.
+        self.counters.stages.user_changes.start();
+        #[cfg(feature = "enhanced-determinism")]
+        let impulse_joints_iterator = impulse_joints
+            .to_wake_up
+            .drain(..)
+            .chain(multibody_joints.to_wake_up.drain(..));
+        #[cfg(not(feature = "enhanced-determinism"))]
+        let impulse_joints_iterator = impulse_joints
+            .to_wake_up
+            .drain()
+            .chain(multibody_joints.to_wake_up.drain());
+        for handle in impulse_joints_iterator {
+            islands.wake_up(bodies, handle, true);
+        }
 
-    //     // Apply modifications.
-    //     let mut modified_colliders = colliders.take_modified();
-    //     let mut removed_colliders = colliders.take_removed();
+        // Apply modifications.
+        let mut modified_colliders = colliders.take_modified();
+        let mut removed_colliders = colliders.take_removed();
 
-    //     super::user_changes::handle_user_changes_to_colliders(
-    //         bodies,
-    //         colliders,
-    //         &modified_colliders[..],
-    //     );
+        super::user_changes::handle_user_changes_to_colliders(
+            bodies,
+            colliders,
+            &modified_colliders[..],
+        );
 
-    //     let mut modified_bodies = bodies.take_modified();
-    //     super::user_changes::handle_user_changes_to_rigid_bodies(
-    //         Some(islands),
-    //         bodies,
-    //         colliders,
-    //         impulse_joints,
-    //         multibody_joints,
-    //         &modified_bodies,
-    //         &mut modified_colliders,
-    //     );
+        let mut modified_bodies = bodies.take_modified();
+        super::user_changes::handle_user_changes_to_rigid_bodies(
+            Some(islands),
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_bodies,
+            &mut modified_colliders,
+        );
 
-    //     // Disabled colliders are treated as if they were removed.
-    //     // NOTE: this must be called here, after handle_user_changes_to_rigid_bodies to take into
-    //     //       account colliders disabled because of their parent rigid-body.
-    //     removed_colliders.extend(
-    //         modified_colliders
-    //             .iter()
-    //             .copied()
-    //             .filter(|h| colliders.get(*h).map(|c| !c.is_enabled()).unwrap_or(false)),
-    //     );
-    //     self.counters.stages.user_changes.pause();
+        // Disabled colliders are treated as if they were removed.
+        // NOTE: this must be called here, after handle_user_changes_to_rigid_bodies to take into
+        //       account colliders disabled because of their parent rigid-body.
+        removed_colliders.extend(
+            modified_colliders
+                .iter()
+                .copied()
+                .filter(|h| colliders.get(*h).map(|c| !c.is_enabled()).unwrap_or(false)),
+        );
+        self.counters.stages.user_changes.pause();
 
-    //     // TODO: do this only on user-change.
-    //     // TODO: do we want some kind of automatic inverse kinematics?
-    //     for multibody in &mut multibody_joints.multibodies {
-    //         multibody.1.forward_kinematics(bodies, true);
-    //         multibody
-    //             .1
-    //             .update_rigid_bodies_internal(bodies, true, false, false);
-    //     }
+        // TODO: do this only on user-change.
+        // TODO: do we want some kind of automatic inverse kinematics?
+        for multibody in &mut multibody_joints.multibodies {
+            multibody.1.forward_kinematics(bodies, true);
+            multibody
+                .1
+                .update_rigid_bodies_internal(bodies, true, false, false);
+        }
 
-    //     self.detect_collisions(
-    //         integration_parameters,
-    //         islands,
-    //         broad_phase,
-    //         narrow_phase,
-    //         bodies,
-    //         colliders,
-    //         impulse_joints,
-    //         multibody_joints,
-    //         &modified_colliders,
-    //         &removed_colliders,
-    //         hooks,
-    //         events,
-    //         true,
-    //     );
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            true,
+        );
 
-    //     self.counters.stages.user_changes.resume();
-    //     self.clear_modified_colliders(colliders, &mut modified_colliders);
-    //     self.clear_modified_bodies(bodies, &mut modified_bodies);
-    //     removed_colliders.clear();
-    //     self.counters.stages.user_changes.pause();
+        self.counters.stages.user_changes.resume();
+        self.clear_modified_colliders(colliders, &mut modified_colliders);
+        self.clear_modified_bodies(bodies, &mut modified_bodies);
+        removed_colliders.clear();
+        self.counters.stages.user_changes.pause();
 
-    //     let mut remaining_time = integration_parameters.dt;
-    //     let mut integration_parameters = *integration_parameters;
+        let mut remaining_time = integration_parameters.dt;
+        let mut integration_parameters = *integration_parameters;
 
-    //     let (ccd_is_enabled, mut remaining_substeps) =
-    //         if integration_parameters.max_ccd_substeps == 0 {
-    //             (false, 1)
-    //         } else {
-    //             (true, integration_parameters.max_ccd_substeps)
-    //         };
+        let (ccd_is_enabled, mut remaining_substeps) =
+            if integration_parameters.max_ccd_substeps == 0 {
+                (false, 1)
+            } else {
+                (true, integration_parameters.max_ccd_substeps)
+            };
 
-    //     while remaining_substeps > 0 {
-    //         // If there are more than one CCD substep, we need to split
-    //         // the timestep into multiple intervals. First, estimate the
-    //         // size of the time slice we will integrate for this substep.
-    //         //
-    //         // Note that we must do this now, before the constraints resolution
-    //         // because we need to use the correct timestep length for the
-    //         // integration of external forces.
-    //         //
-    //         // If there is only one or zero CCD substep, there is no need
-    //         // to split the timestep interval. So we can just skip this part.
-    //         if ccd_is_enabled && remaining_substeps > 1 {
-    //             // NOTE: Take forces into account when updating the bodies CCD activation flags
-    //             //       these forces have not been integrated to the body's velocity yet.
-    //             let ccd_active =
-    //                 ccd_solver.update_ccd_active_flags(islands, bodies, remaining_time, true);
-    //             let first_impact = if ccd_active {
-    //                 ccd_solver.find_first_impact(
-    //                     remaining_time,
-    //                     &integration_parameters,
-    //                     islands,
-    //                     bodies,
-    //                     colliders,
-    //                     broad_phase,
-    //                     narrow_phase,
-    //                 )
-    //             } else {
-    //                 None
-    //             };
+        while remaining_substeps > 0 {
+            // If there are more than one CCD substep, we need to split
+            // the timestep into multiple intervals. First, estimate the
+            // size of the time slice we will integrate for this substep.
+            //
+            // Note that we must do this now, before the constraints resolution
+            // because we need to use the correct timestep length for the
+            // integration of external forces.
+            //
+            // If there is only one or zero CCD substep, there is no need
+            // to split the timestep interval. So we can just skip this part.
+            if ccd_is_enabled && remaining_substeps > 1 {
+                // NOTE: Take forces into account when updating the bodies CCD activation flags
+                //       these forces have not been integrated to the body's velocity yet.
+                let ccd_active =
+                    ccd_solver.update_ccd_active_flags(islands, bodies, remaining_time, true);
+                let first_impact = if ccd_active {
+                    ccd_solver.find_first_impact(
+                        remaining_time,
+                        &integration_parameters,
+                        islands,
+                        bodies,
+                        colliders,
+                        broad_phase,
+                        narrow_phase,
+                    )
+                } else {
+                    None
+                };
 
-    //             if let Some(toi) = first_impact {
-    //                 let original_interval = remaining_time / (remaining_substeps as Real);
+                if let Some(toi) = first_impact {
+                    let original_interval = remaining_time / (remaining_substeps as Real);
 
-    //                 if toi < original_interval {
-    //                     integration_parameters.dt = original_interval;
-    //                 } else {
-    //                     integration_parameters.dt =
-    //                         toi + (remaining_time - toi) / (remaining_substeps as Real);
-    //                 }
+                    if toi < original_interval {
+                        integration_parameters.dt = original_interval;
+                    } else {
+                        integration_parameters.dt =
+                            toi + (remaining_time - toi) / (remaining_substeps as Real);
+                    }
 
-    //                 remaining_substeps -= 1;
-    //             } else {
-    //                 // No impact, don't do any other substep after this one.
-    //                 integration_parameters.dt = remaining_time;
-    //                 remaining_substeps = 0;
-    //             }
+                    remaining_substeps -= 1;
+                } else {
+                    // No impact, don't do any other substep after this one.
+                    integration_parameters.dt = remaining_time;
+                    remaining_substeps = 0;
+                }
 
-    //             remaining_time -= integration_parameters.dt;
+                remaining_time -= integration_parameters.dt;
 
-    //             // Avoid substep length that are too small.
-    //             if remaining_time <= integration_parameters.min_ccd_dt {
-    //                 integration_parameters.dt += remaining_time;
-    //                 remaining_substeps = 0;
-    //             }
-    //         } else {
-    //             integration_parameters.dt = remaining_time;
-    //             remaining_time = 0.0;
-    //             remaining_substeps = 0;
-    //         }
+                // Avoid substep length that are too small.
+                if remaining_time <= integration_parameters.min_ccd_dt {
+                    integration_parameters.dt += remaining_time;
+                    remaining_substeps = 0;
+                }
+            } else {
+                integration_parameters.dt = remaining_time;
+                remaining_time = 0.0;
+                remaining_substeps = 0;
+            }
 
-    //         self.counters.ccd.num_substeps += 1;
+            self.counters.ccd.num_substeps += 1;
 
-    //         self.interpolate_kinematic_velocities(&integration_parameters, islands, bodies);
-    //         self.build_islands_and_solve_velocity_constraints(
-    //             gravity,
-    //             &integration_parameters,
-    //             islands,
-    //             narrow_phase,
-    //             bodies,
-    //             colliders,
-    //             impulse_joints,
-    //             multibody_joints,
-    //             events,
-    //         );
+            self.interpolate_kinematic_velocities(&integration_parameters, islands, bodies);
+            self.build_islands_and_solve_velocity_constraints(
+                gravity,
+                &integration_parameters,
+                islands,
+                narrow_phase,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                events,
+            );
 
-    //         // If CCD is enabled, execute the CCD motion clamping.
-    //         if ccd_is_enabled {
-    //             // NOTE: don't the forces into account when updating the CCD active flags because
-    //             //       they have already been integrated into the velocities by the solver.
-    //             let ccd_active = ccd_solver.update_ccd_active_flags(
-    //                 islands,
-    //                 bodies,
-    //                 integration_parameters.dt,
-    //                 false,
-    //             );
-    //             if ccd_active {
-    //                 self.run_ccd_motion_clamping(
-    //                     &integration_parameters,
-    //                     islands,
-    //                     bodies,
-    //                     colliders,
-    //                     broad_phase,
-    //                     narrow_phase,
-    //                     ccd_solver,
-    //                     events,
-    //                 );
-    //             }
-    //         }
+            // If CCD is enabled, execute the CCD motion clamping.
+            if ccd_is_enabled {
+                // NOTE: don't the forces into account when updating the CCD active flags because
+                //       they have already been integrated into the velocities by the solver.
+                let ccd_active = ccd_solver.update_ccd_active_flags(
+                    islands,
+                    bodies,
+                    integration_parameters.dt,
+                    false,
+                );
+                if ccd_active {
+                    self.run_ccd_motion_clamping(
+                        &integration_parameters,
+                        islands,
+                        bodies,
+                        colliders,
+                        broad_phase,
+                        narrow_phase,
+                        ccd_solver,
+                        events,
+                    );
+                }
+            }
 
-    //         self.counters.stages.update_time.resume();
-    //         self.advance_to_final_positions(islands, bodies, colliders, &mut modified_colliders);
-    //         self.counters.stages.update_time.pause();
+            self.counters.stages.update_time.resume();
+            self.advance_to_final_positions(islands, bodies, colliders, &mut modified_colliders);
+            self.counters.stages.update_time.pause();
 
-    //         if remaining_substeps > 0 {
-    //             self.detect_collisions(
-    //                 &integration_parameters,
-    //                 islands,
-    //                 broad_phase,
-    //                 narrow_phase,
-    //                 bodies,
-    //                 colliders,
-    //                 impulse_joints,
-    //                 multibody_joints,
-    //                 &modified_colliders,
-    //                 &[],
-    //                 hooks,
-    //                 events,
-    //                 false,
-    //             );
+            if remaining_substeps > 0 {
+                self.detect_collisions(
+                    &integration_parameters,
+                    islands,
+                    broad_phase,
+                    narrow_phase,
+                    bodies,
+                    colliders,
+                    impulse_joints,
+                    multibody_joints,
+                    &modified_colliders,
+                    &[],
+                    hooks,
+                    events,
+                    false,
+                );
 
-    //             self.clear_modified_colliders(colliders, &mut modified_colliders);
-    //         } else {
-    //             // If we ran the last substep, just update the broad-phase bvh instead
-    //             // of a full collision-detection step.
-    //             for handle in modified_colliders.iter() {
-    //                 let co = colliders.index_mut_internal(*handle);
-    //                 // NOTE: `advance_to_final_positions` might have added disabled colliders to
-    //                 //       `modified_colliders`. This raises the question: do we want
-    //                 //       rigid-body transform propagation to happen on disabled colliders if
-    //                 //       their parent rigid-body is enabled? For now, we are propagating as
-    //                 //       it feels less surprising to the user and makes handling collider
-    //                 //       re-enable less awkward.
-    //                 if co.is_enabled() {
-    //                     let aabb = co.compute_broad_phase_aabb(&integration_parameters, bodies);
-    //                     broad_phase.set_aabb(&integration_parameters, *handle, aabb);
-    //                 }
+                self.clear_modified_colliders(colliders, &mut modified_colliders);
+            } else {
+                // If we ran the last substep, just update the broad-phase bvh instead
+                // of a full collision-detection step.
+                for handle in modified_colliders.iter() {
+                    let co = colliders.index_mut_internal(*handle);
+                    // NOTE: `advance_to_final_positions` might have added disabled colliders to
+                    //       `modified_colliders`. This raises the question: do we want
+                    //       rigid-body transform propagation to happen on disabled colliders if
+                    //       their parent rigid-body is enabled? For now, we are propagating as
+                    //       it feels less surprising to the user and makes handling collider
+                    //       re-enable less awkward.
+                    if co.is_enabled() {
+                        let aabb = co.compute_broad_phase_aabb(&integration_parameters, bodies);
+                        broad_phase.set_aabb(&integration_parameters, *handle, aabb);
+                    }
 
-    //                 // Clear the modified collider set, but keep the other collider changes flags.
-    //                 // This is needed so that the narrow-phase at the next timestep knows it must
-    //                 // not skip these colliders for its update.
-    //                 // TODO: this doesn’t feel very clean, but leaving the collider in the modified
-    //                 //       set would be expensive as this will be traversed by all the user-changes
-    //                 //       functions. An alternative would be to maintain a second modified set,
-    //                 //       one for user changes, and one for changes applied by the solver but that
-    //                 //       feels a bit too much. Let’s keep it simple for now and we’ll see how it
-    //                 //       goes after the persistent island rework.
-    //                 co.changes.remove(ColliderChanges::IN_MODIFIED_SET);
-    //             }
+                    // Clear the modified collider set, but keep the other collider changes flags.
+                    // This is needed so that the narrow-phase at the next timestep knows it must
+                    // not skip these colliders for its update.
+                    // TODO: this doesn’t feel very clean, but leaving the collider in the modified
+                    //       set would be expensive as this will be traversed by all the user-changes
+                    //       functions. An alternative would be to maintain a second modified set,
+                    //       one for user changes, and one for changes applied by the solver but that
+                    //       feels a bit too much. Let’s keep it simple for now and we’ll see how it
+                    //       goes after the persistent island rework.
+                    co.changes.remove(ColliderChanges::IN_MODIFIED_SET);
+                }
 
-    //             // Empty the modified colliders set. See comment for `co.change.remove(..)` above.
-    //             modified_colliders.clear();
-    //         }
-    //     }
+                // Empty the modified colliders set. See comment for `co.change.remove(..)` above.
+                modified_colliders.clear();
+            }
+        }
 
-    //     // Finally, make sure we update the world mass-properties of the rigid-bodies
-    //     // that moved. Otherwise, users may end up applying forces with respect to an
-    //     // outdated center of mass.
-    //     // TODO: avoid updating the world mass properties twice (here, and
-    //     //       at the beginning of the next timestep) for bodies that were
-    //     //       not modified by the user in the mean time.
-    //     self.counters.stages.update_time.resume();
-    //     for handle in islands.active_bodies() {
-    //         let rb = bodies.index_mut_internal(*handle);
-    //         rb.mprops
-    //             .update_world_mass_properties(rb.body_type, &rb.pos.position);
-    //     }
-    //     self.counters.stages.update_time.pause();
+        // Finally, make sure we update the world mass-properties of the rigid-bodies
+        // that moved. Otherwise, users may end up applying forces with respect to an
+        // outdated center of mass.
+        // TODO: avoid updating the world mass properties twice (here, and
+        //       at the beginning of the next timestep) for bodies that were
+        //       not modified by the user in the mean time.
+        self.counters.stages.update_time.resume();
+        for handle in islands.active_bodies() {
+            let rb = bodies.index_mut_internal(*handle);
+            rb.mprops
+                .update_world_mass_properties(rb.body_type, &rb.pos.position);
+        }
+        self.counters.stages.update_time.pause();
 
-    //     // Re-insert the modified vector we extracted for the borrow-checker.
-    //     colliders.set_modified(modified_colliders);
+        // Re-insert the modified vector we extracted for the borrow-checker.
+        colliders.set_modified(modified_colliders);
 
-    //     self.counters.step_completed();
-    // }
+        self.counters.step_completed();
+    }
 
-    pub fn step(
+    /// this version works, but trying an even more granular version
+    pub fn step_v2(
         &mut self,
         gravity: &Vector<Real>,
         integration_parameters: &IntegrationParameters,
@@ -807,6 +810,523 @@ impl PhysicsPipeline {
         colliders.set_modified(modified_colliders);
 
         self.counters.step_completed();
+    }
+
+    pub fn user_changes_stage_part_1(
+        &mut self,
+        // gravity: &Vector<Real>,
+        // integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        // broad_phase: &mut BroadPhaseBvh,
+        // narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        // ccd_solver: &mut CCDSolver,
+        // hooks: &dyn PhysicsHooks,
+        // events: &dyn EventHandler,
+    ) -> (
+        ModifiedObjects<ColliderHandle, Collider>,
+        Vec<ColliderHandle>,
+        ModifiedObjects<RigidBodyHandle, RigidBody>,
+    ) {
+        // Apply some of delayed wake-ups.
+        self.counters.stages.user_changes.start();
+        #[cfg(feature = "enhanced-determinism")]
+        let impulse_joints_iterator = impulse_joints
+            .to_wake_up
+            .drain(..)
+            .chain(multibody_joints.to_wake_up.drain(..));
+        #[cfg(not(feature = "enhanced-determinism"))]
+        let impulse_joints_iterator = impulse_joints
+            .to_wake_up
+            .drain()
+            .chain(multibody_joints.to_wake_up.drain());
+        for handle in impulse_joints_iterator {
+            islands.wake_up(bodies, handle, true);
+        }
+
+        // Apply modifications.
+        let mut modified_colliders = colliders.take_modified();
+        let mut removed_colliders = colliders.take_removed();
+
+        super::user_changes::handle_user_changes_to_colliders(
+            bodies,
+            colliders,
+            &modified_colliders[..],
+        );
+
+        let mut modified_bodies = bodies.take_modified();
+        super::user_changes::handle_user_changes_to_rigid_bodies(
+            Some(islands),
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_bodies,
+            &mut modified_colliders,
+        );
+
+        // Disabled colliders are treated as if they were removed.
+        // NOTE: this must be called here, after handle_user_changes_to_rigid_bodies to take into
+        //       account colliders disabled because of their parent rigid-body.
+        removed_colliders.extend(
+            modified_colliders
+                .iter()
+                .copied()
+                .filter(|h| colliders.get(*h).map(|c| !c.is_enabled()).unwrap_or(false)),
+        );
+        self.counters.stages.user_changes.pause();
+
+        // TODO: do this only on user-change.
+        // TODO: do we want some kind of automatic inverse kinematics?
+        for multibody in &mut multibody_joints.multibodies {
+            multibody.1.forward_kinematics(bodies, true);
+            multibody
+                .1
+                .update_rigid_bodies_internal(bodies, true, false, false);
+        }
+
+        (modified_colliders, removed_colliders, modified_bodies)
+    }
+
+    pub fn user_changes_stage_part_2(
+        &mut self,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        modified_colliders: &mut ModifiedObjects<ColliderHandle, Collider>,
+        removed_colliders: &mut Vec<ColliderHandle>,
+        modified_bodies: &mut ModifiedObjects<RigidBodyHandle, RigidBody>,
+    ) {
+        self.counters.stages.user_changes.resume();
+        self.clear_modified_colliders(colliders, modified_colliders);
+        self.clear_modified_bodies(bodies, modified_bodies);
+        removed_colliders.clear();
+        self.counters.stages.user_changes.pause();
+    }
+
+    pub fn substeps_stage(
+        &mut self,
+        gravity: &Vector<Real>,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+        modified_colliders: &mut ModifiedObjects<ColliderHandle, Collider>,
+        modified_bodies: &mut ModifiedObjects<RigidBodyHandle, RigidBody>,
+    ) {
+        let mut remaining_time = integration_parameters.dt;
+        let mut integration_parameters = *integration_parameters;
+
+        let (ccd_is_enabled, mut remaining_substeps) =
+            if integration_parameters.max_ccd_substeps == 0 {
+                (false, 1)
+            } else {
+                (true, integration_parameters.max_ccd_substeps)
+            };
+
+        while remaining_substeps > 0 {
+            // If there are more than one CCD substep, we need to split
+            // the timestep into multiple intervals. First, estimate the
+            // size of the time slice we will integrate for this substep.
+            //
+            // Note that we must do this now, before the constraints resolution
+            // because we need to use the correct timestep length for the
+            // integration of external forces.
+            //
+            // If there is only one or zero CCD substep, there is no need
+            // to split the timestep interval. So we can just skip this part.
+            if ccd_is_enabled && remaining_substeps > 1 {
+                // NOTE: Take forces into account when updating the bodies CCD activation flags
+                //       these forces have not been integrated to the body's velocity yet.
+                let ccd_active =
+                    ccd_solver.update_ccd_active_flags(islands, bodies, remaining_time, true);
+                let first_impact = if ccd_active {
+                    ccd_solver.find_first_impact(
+                        remaining_time,
+                        &integration_parameters,
+                        islands,
+                        bodies,
+                        colliders,
+                        broad_phase,
+                        narrow_phase,
+                    )
+                } else {
+                    None
+                };
+
+                if let Some(toi) = first_impact {
+                    let original_interval = remaining_time / (remaining_substeps as Real);
+
+                    if toi < original_interval {
+                        integration_parameters.dt = original_interval;
+                    } else {
+                        integration_parameters.dt =
+                            toi + (remaining_time - toi) / (remaining_substeps as Real);
+                    }
+
+                    remaining_substeps -= 1;
+                } else {
+                    // No impact, don't do any other substep after this one.
+                    integration_parameters.dt = remaining_time;
+                    remaining_substeps = 0;
+                }
+
+                remaining_time -= integration_parameters.dt;
+
+                // Avoid substep length that are too small.
+                if remaining_time <= integration_parameters.min_ccd_dt {
+                    integration_parameters.dt += remaining_time;
+                    remaining_substeps = 0;
+                }
+            } else {
+                integration_parameters.dt = remaining_time;
+                remaining_time = 0.0;
+                remaining_substeps = 0;
+            }
+
+            self.counters.ccd.num_substeps += 1;
+
+            self.interpolate_kinematic_velocities(&integration_parameters, islands, bodies);
+            self.build_islands_and_solve_velocity_constraints(
+                gravity,
+                &integration_parameters,
+                islands,
+                narrow_phase,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                events,
+            );
+
+            // If CCD is enabled, execute the CCD motion clamping.
+            if ccd_is_enabled {
+                // NOTE: don't the forces into account when updating the CCD active flags because
+                //       they have already been integrated into the velocities by the solver.
+                let ccd_active = ccd_solver.update_ccd_active_flags(
+                    islands,
+                    bodies,
+                    integration_parameters.dt,
+                    false,
+                );
+                if ccd_active {
+                    self.run_ccd_motion_clamping(
+                        &integration_parameters,
+                        islands,
+                        bodies,
+                        colliders,
+                        broad_phase,
+                        narrow_phase,
+                        ccd_solver,
+                        events,
+                    );
+                }
+            }
+
+            self.counters.stages.update_time.resume();
+            self.advance_to_final_positions(islands, bodies, colliders, modified_colliders);
+            self.counters.stages.update_time.pause();
+
+            if remaining_substeps > 0 {
+                self.detect_collisions(
+                    &integration_parameters,
+                    islands,
+                    broad_phase,
+                    narrow_phase,
+                    bodies,
+                    colliders,
+                    impulse_joints,
+                    multibody_joints,
+                    &modified_colliders,
+                    &[],
+                    hooks,
+                    events,
+                    false,
+                );
+
+                self.clear_modified_colliders(colliders, modified_colliders);
+            } else {
+                // If we ran the last substep, just update the broad-phase bvh instead
+                // of a full collision-detection step.
+                for handle in modified_colliders.iter() {
+                    let co = colliders.index_mut_internal(*handle);
+                    // NOTE: `advance_to_final_positions` might have added disabled colliders to
+                    //       `modified_colliders`. This raises the question: do we want
+                    //       rigid-body transform propagation to happen on disabled colliders if
+                    //       their parent rigid-body is enabled? For now, we are propagating as
+                    //       it feels less surprising to the user and makes handling collider
+                    //       re-enable less awkward.
+                    if co.is_enabled() {
+                        let aabb = co.compute_broad_phase_aabb(&integration_parameters, bodies);
+                        broad_phase.set_aabb(&integration_parameters, *handle, aabb);
+                    }
+
+                    // Clear the modified collider set, but keep the other collider changes flags.
+                    // This is needed so that the narrow-phase at the next timestep knows it must
+                    // not skip these colliders for its update.
+                    // TODO: this doesn’t feel very clean, but leaving the collider in the modified
+                    //       set would be expensive as this will be traversed by all the user-changes
+                    //       functions. An alternative would be to maintain a second modified set,
+                    //       one for user changes, and one for changes applied by the solver but that
+                    //       feels a bit too much. Let’s keep it simple for now and we’ll see how it
+                    //       goes after the persistent island rework.
+                    co.changes.remove(ColliderChanges::IN_MODIFIED_SET);
+                }
+
+                // Empty the modified colliders set. See comment for `co.change.remove(..)` above.
+                modified_colliders.clear();
+            }
+        }
+    }
+
+    pub fn update_mass_properties_of_moved_bodies_stage(
+        &mut self,
+        islands: &IslandManager,
+        bodies: &mut RigidBodySet,
+    ) {
+        // Finally, make sure we update the world mass-properties of the rigid-bodies
+        // that moved. Otherwise, users may end up applying forces with respect to an
+        // outdated center of mass.
+        // TODO: avoid updating the world mass properties twice (here, and
+        //       at the beginning of the next timestep) for bodies that were
+        //       not modified by the user in the mean time.
+        self.counters.stages.update_time.resume();
+        for handle in islands.active_bodies() {
+            let rb = bodies.index_mut_internal(*handle);
+            rb.mprops
+                .update_world_mass_properties(rb.body_type, &rb.pos.position);
+        }
+        self.counters.stages.update_time.pause();
+    }
+
+    /// TODO no docs yet
+    pub fn step(
+        &mut self,
+        gravity: &Vector<Real>,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.counters.reset();
+        self.counters.step_started();
+
+        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
+            .user_changes_stage_part_1(
+                islands,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+            );
+
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            true,
+        );
+
+        self.user_changes_stage_part_2(
+            bodies,
+            colliders,
+            &mut modified_colliders,
+            &mut removed_colliders,
+            &mut modified_bodies,
+        );
+
+        self.substeps_stage(
+            gravity,
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            ccd_solver,
+            hooks,
+            events,
+            &mut modified_colliders,
+            &mut modified_bodies,
+        );
+
+        self.update_mass_properties_of_moved_bodies_stage(islands, bodies);
+
+        // Re-insert the modified vector we extracted for the borrow-checker.
+        colliders.set_modified(modified_colliders);
+
+        self.counters.step_completed();
+    }
+
+    /// This function must be run once before the first call to `step_collisions_last_more_granular`
+    pub fn initialize_for_step_collisions_last(
+        &mut self,
+        // gravity: &Vector<Real>,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        // ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+        // mut modified_colliders: ModifiedObjects<ColliderHandle, Collider>,
+        // mut removed_colliders: Vec<ColliderHandle>,
+        // mut modified_bodies: ModifiedObjects<RigidBodyHandle, RigidBody>,
+    ) -> (
+        ModifiedObjects<ColliderHandle, Collider>,
+        Vec<ColliderHandle>,
+        ModifiedObjects<RigidBodyHandle, RigidBody>,
+    ) {
+        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
+            .user_changes_stage_part_1(
+                islands,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+            );
+
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            true,
+        );
+
+        self.user_changes_stage_part_2(
+            bodies,
+            colliders,
+            &mut modified_colliders,
+            &mut removed_colliders,
+            &mut modified_bodies,
+        );
+
+        (modified_colliders, removed_colliders, modified_bodies)
+    }
+
+    pub fn step_collisions_last(
+        &mut self,
+        gravity: &Vector<Real>,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+        mut modified_colliders: ModifiedObjects<ColliderHandle, Collider>,
+        mut removed_colliders: Vec<ColliderHandle>,
+        mut modified_bodies: ModifiedObjects<RigidBodyHandle, RigidBody>,
+    ) -> (
+        ModifiedObjects<ColliderHandle, Collider>,
+        Vec<ColliderHandle>,
+        ModifiedObjects<RigidBodyHandle, RigidBody>,
+    ) {
+        self.counters.reset();
+        self.counters.step_started();
+
+        self.substeps_stage(
+            gravity,
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            ccd_solver,
+            hooks,
+            events,
+            &mut modified_colliders,
+            &mut modified_bodies,
+        );
+
+        self.update_mass_properties_of_moved_bodies_stage(islands, bodies);
+
+        // Re-insert the modified vector we extracted for the borrow-checker.
+        colliders.set_modified(modified_colliders);
+
+        self.counters.step_completed();
+
+        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
+            .user_changes_stage_part_1(
+                islands,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+            );
+
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            true,
+        );
+
+        self.user_changes_stage_part_2(
+            bodies,
+            colliders,
+            &mut modified_colliders,
+            &mut removed_colliders,
+            &mut modified_bodies,
+        );
+
+        (modified_colliders, removed_colliders, modified_bodies)
     }
 
     /// Advances the physics simulation by one timestep, but runs the collision detection phase
@@ -867,7 +1387,7 @@ impl PhysicsPipeline {
     ///     );
     /// }
     /// ```
-    pub fn step_collisions_last(
+    pub fn step_collisions_last_OLD_LLM_VERSION(
         &mut self,
         gravity: &Vector<Real>,
         integration_parameters: &IntegrationParameters,
@@ -885,7 +1405,58 @@ impl PhysicsPipeline {
         self.counters.reset();
         self.counters.step_started();
 
+        // Process user changes (new/modified bodies, joints, colliders) before
+        // the integration phase so that newly added bodies are in the active set
+        // and have valid island IDs when the solver runs.
+        self.counters.stages.user_changes.start();
+        #[cfg(feature = "enhanced-determinism")]
+        let impulse_joints_iterator = impulse_joints
+            .to_wake_up
+            .drain(..)
+            .chain(multibody_joints.to_wake_up.drain(..));
+        #[cfg(not(feature = "enhanced-determinism"))]
+        let impulse_joints_iterator = impulse_joints
+            .to_wake_up
+            .drain()
+            .chain(multibody_joints.to_wake_up.drain());
+        for handle in impulse_joints_iterator {
+            islands.wake_up(bodies, handle, true);
+        }
+
         let mut modified_colliders = colliders.take_modified();
+        let removed_colliders = colliders.take_removed();
+
+        super::user_changes::handle_user_changes_to_colliders(
+            bodies,
+            colliders,
+            &modified_colliders[..],
+        );
+
+        let mut modified_bodies = bodies.take_modified();
+        super::user_changes::handle_user_changes_to_rigid_bodies(
+            Some(islands),
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_bodies,
+            &mut modified_colliders,
+        );
+        self.counters.stages.user_changes.pause();
+
+        // Forward kinematics for multibodies.
+        for multibody in &mut multibody_joints.multibodies {
+            multibody.1.forward_kinematics(bodies, true);
+            multibody
+                .1
+                .update_rigid_bodies_internal(bodies, true, false, false);
+        }
+
+        // Clear user-changes flags so step_collision_detection_phase won't
+        // re-process the same changes, but don't clear modified_colliders
+        // yet as the integration phase needs them.
+        self.clear_modified_bodies(bodies, &mut modified_bodies);
+        drop(removed_colliders);
 
         self.step_integration_phase(
             &mut modified_colliders,
@@ -1745,23 +2316,8 @@ mod test {
         colliders.insert_with_parent(ball_collider, ball_handle, &mut bodies);
 
         // Run the collision detection phase once before the loop.
-        pipeline.step_collision_detection_phase(
-            &integration_parameters,
-            &mut islands,
-            &mut broad_phase,
-            &mut narrow_phase,
-            &mut bodies,
-            &mut colliders,
-            &mut impulse_joints,
-            &mut multibody_joints,
-            &(),
-            &(),
-        );
-
-        // Run 100 iterations with step_collisions_last.
-        for _ in 0..100 {
-            pipeline.step_collisions_last(
-                &gravity,
+        let (modified_colliders, removed_colliders, modified_bodies) = pipeline
+            .initialize_for_step_collisions_last(
                 &integration_parameters,
                 &mut islands,
                 &mut broad_phase,
@@ -1770,11 +2326,32 @@ mod test {
                 &mut colliders,
                 &mut impulse_joints,
                 &mut multibody_joints,
-                &mut ccd,
                 &(),
                 &(),
             );
-        }
+
+        [0..100].iter().fold(
+            (modified_colliders, removed_colliders, modified_bodies),
+            |(modified_colliders, removed_colliders, modified_bodies), _| {
+                pipeline.step_collisions_last(
+                    &gravity,
+                    &integration_parameters,
+                    &mut islands,
+                    &mut broad_phase,
+                    &mut narrow_phase,
+                    &mut bodies,
+                    &mut colliders,
+                    &mut impulse_joints,
+                    &mut multibody_joints,
+                    &mut ccd,
+                    &(),
+                    &(),
+                    modified_colliders,
+                    removed_colliders,
+                    modified_bodies,
+                )
+            },
+        );
 
         // Verify the ball has fallen and is near the floor (not below it).
         let ball_pos = bodies[ball_handle].translation().y;
@@ -1897,22 +2474,8 @@ mod test {
             &mut bodies_b,
         );
 
-        pipeline_b.step_collision_detection_phase(
-            &integration_parameters,
-            &mut islands_b,
-            &mut broad_phase_b,
-            &mut narrow_phase_b,
-            &mut bodies_b,
-            &mut colliders_b,
-            &mut impulse_joints_b,
-            &mut multibody_joints_b,
-            &(),
-            &(),
-        );
-
-        for _ in 0..100 {
-            pipeline_b.step_collisions_last(
-                &gravity,
+        let (modified_colliders, removed_colliders, modified_bodies) = pipeline_b
+            .initialize_for_step_collisions_last(
                 &integration_parameters,
                 &mut islands_b,
                 &mut broad_phase_b,
@@ -1921,11 +2484,32 @@ mod test {
                 &mut colliders_b,
                 &mut impulse_joints_b,
                 &mut multibody_joints_b,
-                &mut ccd_b,
                 &(),
                 &(),
             );
-        }
+
+        [0..100].iter().fold(
+            (modified_colliders, removed_colliders, modified_bodies),
+            |(modified_colliders, removed_colliders, modified_bodies), _| {
+                pipeline_b.step_collisions_last(
+                    &gravity,
+                    &integration_parameters,
+                    &mut islands_b,
+                    &mut broad_phase_b,
+                    &mut narrow_phase_b,
+                    &mut bodies_b,
+                    &mut colliders_b,
+                    &mut impulse_joints_b,
+                    &mut multibody_joints_b,
+                    &mut ccd_b,
+                    &(),
+                    &(),
+                    modified_colliders,
+                    removed_colliders,
+                    modified_bodies,
+                )
+            },
+        );
 
         // Both should produce similar results (ball resting on floor).
         let pos_a = bodies_a[ball_a].translation().y;
@@ -1936,5 +2520,139 @@ mod test {
             "step() and step_collisions_last() should produce comparable results: \
              step={pos_a}, step_collisions_last={pos_b}, diff={diff}"
         );
+    }
+
+    #[test]
+    fn step_collisions_last_joint_added_between_steps() {
+        // Reproduces a panic where adding a joint between calls to
+        // step_collisions_last causes an index-out-of-bounds in
+        // select_active_interactions because the new body hasn't been
+        // processed by handle_user_changes_to_rigid_bodies yet.
+        use na::vector;
+
+        let mut pipeline = PhysicsPipeline::new();
+        let gravity = Vector::y() * -9.81;
+        let integration_parameters = IntegrationParameters::default();
+        let mut broad_phase = BroadPhaseBvh::new();
+        let mut narrow_phase = NarrowPhase::new();
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut ccd = CCDSolver::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut islands = IslandManager::new();
+
+        // Create a fixed "world frame" body (like the user's global_frame_body).
+        let fixed_body = bodies.insert(RigidBodyBuilder::fixed().build());
+
+        // Create a dynamic body.
+        #[cfg(feature = "dim2")]
+        let dynamic_body = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![0.0, 5.0])
+                .build(),
+        );
+        #[cfg(feature = "dim3")]
+        let dynamic_body = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![0.0, 5.0, 0.0])
+                .build(),
+        );
+        colliders.insert_with_parent(
+            ColliderBuilder::ball(0.5).build(),
+            dynamic_body,
+            &mut bodies,
+        );
+
+        let (modified_colliders, removed_colliders, modified_bodies) = pipeline
+            .initialize_for_step_collisions_last(
+                &integration_parameters,
+                &mut islands,
+                &mut broad_phase,
+                &mut narrow_phase,
+                &mut bodies,
+                &mut colliders,
+                &mut impulse_joints,
+                &mut multibody_joints,
+                &(),
+                &(),
+            );
+
+        let (modified_colliders, removed_colliders, modified_bodies) = [0..10].iter().fold(
+            (modified_colliders, removed_colliders, modified_bodies),
+            |(modified_colliders, removed_colliders, modified_bodies), _| {
+                pipeline.step_collisions_last(
+                    &gravity,
+                    &integration_parameters,
+                    &mut islands,
+                    &mut broad_phase,
+                    &mut narrow_phase,
+                    &mut bodies,
+                    &mut colliders,
+                    &mut impulse_joints,
+                    &mut multibody_joints,
+                    &mut ccd,
+                    &(),
+                    &(),
+                    modified_colliders,
+                    removed_colliders,
+                    modified_bodies,
+                )
+            },
+        );
+
+        // Now add a new dynamic body and a joint BETWEEN steps.
+        // This is the scenario that triggers the bug.
+        #[cfg(feature = "dim2")]
+        let new_body = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![2.0, 5.0])
+                .build(),
+        );
+        #[cfg(feature = "dim3")]
+        let new_body = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![2.0, 5.0, 0.0])
+                .build(),
+        );
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5).build(), new_body, &mut bodies);
+
+        // Add a joint between the fixed body and the new dynamic body.
+        #[cfg(feature = "dim2")]
+        let joint = RevoluteJointBuilder::new().build();
+        #[cfg(feature = "dim3")]
+        let joint = RevoluteJointBuilder::new(Vector::y_axis()).build();
+        impulse_joints.insert(fixed_body, new_body, joint, true);
+
+        // This should NOT panic. Before the fix, it panicked with
+        // "index out of bounds: the len is N but the index is 18446744073709551615"
+        // because step_integration_phase ran before handle_user_changes_to_rigid_bodies
+        // could add the new body to the active set.
+        [0..10].iter().fold(
+            (modified_colliders, removed_colliders, modified_bodies),
+            |(modified_colliders, removed_colliders, modified_bodies), _| {
+                pipeline.step_collisions_last(
+                    &gravity,
+                    &integration_parameters,
+                    &mut islands,
+                    &mut broad_phase,
+                    &mut narrow_phase,
+                    &mut bodies,
+                    &mut colliders,
+                    &mut impulse_joints,
+                    &mut multibody_joints,
+                    &mut ccd,
+                    &(),
+                    &(),
+                    modified_colliders,
+                    removed_colliders,
+                    modified_bodies,
+                )
+            },
+        );
+
+        // Verify both bodies have valid positions.
+        let pos = bodies[new_body].translation().y;
+        assert!(pos.is_finite(), "New body position should be finite");
     }
 }
