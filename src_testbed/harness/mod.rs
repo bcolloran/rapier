@@ -5,11 +5,14 @@ use crate::{
     physics::{PhysicsEvents, PhysicsState},
 };
 use plugin::HarnessPlugin;
+use rapier::data::ModifiedObjects;
 use rapier::dynamics::{
     CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet,
-    RigidBodySet,
+    RigidBody, RigidBodyHandle, RigidBodySet,
 };
-use rapier::geometry::{BroadPhaseBvh, BvhOptimizationStrategy, ColliderSet, NarrowPhase};
+use rapier::geometry::{
+    BroadPhaseBvh, BvhOptimizationStrategy, Collider, ColliderHandle, ColliderSet, NarrowPhase,
+};
 use rapier::math::{Real, Vector};
 use rapier::pipeline::{ChannelEventCollector, PhysicsHooks, PhysicsPipeline};
 
@@ -98,6 +101,12 @@ impl RunState {
     }
 }
 
+type CollisionsLastState = (
+    ModifiedObjects<ColliderHandle, Collider>,
+    Vec<ColliderHandle>,
+    ModifiedObjects<RigidBodyHandle, RigidBody>,
+);
+
 pub struct Harness {
     pub physics: PhysicsState,
     max_steps: usize,
@@ -106,6 +115,8 @@ pub struct Harness {
     events: PhysicsEvents,
     event_handler: ChannelEventCollector,
     pub state: RunState,
+    pub use_step_collisions_last: bool,
+    collisions_last_state: Option<CollisionsLastState>,
 }
 
 type Callbacks =
@@ -133,6 +144,8 @@ impl Harness {
             events,
             event_handler,
             state,
+            use_step_collisions_last: false,
+            collisions_last_state: None,
         }
     }
 
@@ -216,6 +229,7 @@ impl Harness {
         self.physics.ccd_solver = CCDSolver::new();
         self.physics.pipeline = PhysicsPipeline::new();
         self.physics.pipeline.counters.enable();
+        self.collisions_last_state = None;
     }
 
     pub fn add_plugin(&mut self, plugin: impl HarnessPlugin + 'static) {
@@ -237,6 +251,36 @@ impl Harness {
 
     #[profiling::function]
     pub fn step_with_graphics(&mut self, mut graphics: Option<&mut TestbedGraphics>) {
+        if self.use_step_collisions_last {
+            self.step_collisions_last_impl();
+        } else {
+            self.step_normal();
+        }
+
+        for plugin in &mut self.plugins {
+            plugin.step(&mut self.physics, &self.state)
+        }
+
+        for f in &mut self.callbacks {
+            f(
+                graphics.as_deref_mut(),
+                &mut self.physics,
+                &self.events,
+                &self.state,
+            );
+        }
+
+        for plugin in &mut self.plugins {
+            plugin.run_callbacks(&mut self.physics, &self.events, &self.state)
+        }
+
+        self.events.poll_all();
+
+        self.state.time += self.physics.integration_parameters.dt as f32;
+        self.state.timestep_id += 1;
+    }
+
+    fn step_normal(&mut self) {
         #[cfg(feature = "parallel")]
         {
             let physics = &mut self.physics;
@@ -274,28 +318,46 @@ impl Harness {
             &*self.physics.hooks,
             &self.event_handler,
         );
+    }
 
-        for plugin in &mut self.plugins {
-            plugin.step(&mut self.physics, &self.state)
-        }
+    fn step_collisions_last_impl(&mut self) {
+        let (modified_colliders, removed_colliders, modified_bodies) = self
+            .collisions_last_state
+            .take()
+            .unwrap_or_else(|| {
+                self.physics.pipeline.initialize_for_step_collisions_last(
+                    &self.physics.integration_parameters,
+                    &mut self.physics.islands,
+                    &mut self.physics.broad_phase,
+                    &mut self.physics.narrow_phase,
+                    &mut self.physics.bodies,
+                    &mut self.physics.colliders,
+                    &mut self.physics.impulse_joints,
+                    &mut self.physics.multibody_joints,
+                    &*self.physics.hooks,
+                    &self.event_handler,
+                )
+            });
 
-        for f in &mut self.callbacks {
-            f(
-                graphics.as_deref_mut(),
-                &mut self.physics,
-                &self.events,
-                &self.state,
-            );
-        }
+        let new_state = self.physics.pipeline.step_collisions_last(
+            &self.physics.gravity,
+            &self.physics.integration_parameters,
+            &mut self.physics.islands,
+            &mut self.physics.broad_phase,
+            &mut self.physics.narrow_phase,
+            &mut self.physics.bodies,
+            &mut self.physics.colliders,
+            &mut self.physics.impulse_joints,
+            &mut self.physics.multibody_joints,
+            &mut self.physics.ccd_solver,
+            &*self.physics.hooks,
+            &self.event_handler,
+            modified_colliders,
+            removed_colliders,
+            modified_bodies,
+        );
 
-        for plugin in &mut self.plugins {
-            plugin.run_callbacks(&mut self.physics, &self.events, &self.state)
-        }
-
-        self.events.poll_all();
-
-        self.state.time += self.physics.integration_parameters.dt as f32;
-        self.state.timestep_id += 1;
+        self.collisions_last_state = Some(new_state);
     }
 
     pub fn run(&mut self) {

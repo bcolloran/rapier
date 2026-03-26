@@ -350,6 +350,8 @@ impl TestbedApp {
             let builders = mem::take(&mut self.builders.0);
             let backend_names = self.state.backend_names.clone();
 
+            let collisions_last_name = "rapier (collisions last)";
+
             for builder in builders {
                 results.clear();
                 println!("Running benchmark for {}", builder.0);
@@ -407,6 +409,39 @@ impl TestbedApp {
                     results.push(timings);
                 }
 
+                // Run with step_collisions_last.
+                {
+                    println!("|_ using backend {collisions_last_name}");
+                    self.state.selected_backend = RAPIER_BACKEND;
+                    self.harness
+                        .physics
+                        .integration_parameters
+                        .num_solver_iterations = 4;
+                    self.harness.use_step_collisions_last = true;
+
+                    // Re-init world.
+                    let mut testbed = Testbed {
+                        graphics: None,
+                        state: &mut self.state,
+                        harness: &mut self.harness,
+                        #[cfg(feature = "other-backends")]
+                        other_backends: &mut self.other_backends,
+                        plugins: &mut self.plugins,
+                    };
+                    (builder.1)(&mut testbed);
+
+                    let mut timings = Vec::new();
+                    for k in 0..num_bench_iters {
+                        self.harness.step();
+                        if k > 0 {
+                            timings
+                                .push(self.harness.physics.pipeline.counters.step_time.time_ms());
+                        }
+                    }
+                    results.push(timings);
+                    self.harness.use_step_collisions_last = false;
+                }
+
                 // Write the result as a csv file.
                 use inflector::Inflector;
                 let filename = format!("{}.csv", builder.0.to_camel_case());
@@ -416,6 +451,7 @@ impl TestbedApp {
                 for backend in &backend_names[1..] {
                     write!(file, ",{backend}").unwrap();
                 }
+                write!(file, ",{collisions_last_name}").unwrap();
                 writeln!(file).unwrap();
 
                 for i in 0..results[0].len() {
