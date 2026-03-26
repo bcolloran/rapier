@@ -896,6 +896,22 @@ impl PhysicsPipeline {
                 multibody_joints,
             );
 
+        // Remove stale colliders from the narrow phase BEFORE substeps.
+        // In step(), detect_collisions runs before substeps and handles this.
+        // In step_collisions_last(), substeps runs first, so we must clean up
+        // stale contact pairs here to prevent update_active_set_with_contacts
+        // and select_active_contacts from accessing removed colliders/bodies.
+        if !user_removed_colliders.is_empty() {
+            narrow_phase.handle_user_changes(
+                Some(islands),
+                &user_modified_colliders,
+                &user_removed_colliders,
+                colliders,
+                bodies,
+                events,
+            );
+        }
+
         // Run integration substeps using the passed-in (empty) vectors for
         // allocation reuse. These are separate from the user-change vectors
         // above so that substeps' internal clear doesn't lose user-change data.
@@ -1769,5 +1785,154 @@ mod test {
         // Verify both bodies have valid positions.
         let pos = bodies[new_body].translation().y;
         assert!(pos.is_finite(), "New body position should be finite");
+    }
+
+    #[test]
+    fn step_collisions_last_body_removal_between_steps() {
+        // Reproduces a panic where removing a body (that was in contact with
+        // another body) between calls to step_collisions_last causes
+        // "No element at index" in island_manager's update_active_set_with_contacts.
+        //
+        // Root cause: the narrow phase still has stale contact pairs referencing
+        // removed colliders. In step(), detect_collisions runs before substeps
+        // and cleans these up. In step_collisions_last(), substeps runs first
+        // and update_active_set_with_contacts traverses stale contact pairs.
+        use na::vector;
+
+        let mut pipeline = PhysicsPipeline::new();
+        let gravity = Vector::y() * -9.81;
+        let integration_parameters = IntegrationParameters::default();
+        let mut broad_phase = BroadPhaseBvh::new();
+        let mut narrow_phase = NarrowPhase::new();
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut ccd = CCDSolver::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut islands = IslandManager::new();
+
+        // Create a floor.
+        let floor = bodies.insert(RigidBodyBuilder::fixed().build());
+        #[cfg(feature = "dim2")]
+        colliders.insert_with_parent(
+            ColliderBuilder::cuboid(10.0, 0.1).build(),
+            floor,
+            &mut bodies,
+        );
+        #[cfg(feature = "dim3")]
+        colliders.insert_with_parent(
+            ColliderBuilder::cuboid(10.0, 0.1, 10.0).build(),
+            floor,
+            &mut bodies,
+        );
+
+        // Create two dynamic balls that will land on the floor and contact it.
+        #[cfg(feature = "dim2")]
+        let ball1 = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![0.0, 2.0])
+                .build(),
+        );
+        #[cfg(feature = "dim3")]
+        let ball1 = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![0.0, 2.0, 0.0])
+                .build(),
+        );
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5).build(), ball1, &mut bodies);
+
+        #[cfg(feature = "dim2")]
+        let ball2 = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![1.5, 2.0])
+                .build(),
+        );
+        #[cfg(feature = "dim3")]
+        let ball2 = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![1.5, 2.0, 0.0])
+                .build(),
+        );
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5).build(), ball2, &mut bodies);
+
+        // Initialize and run some steps so bodies fall and make contact.
+        let (modified_colliders, removed_colliders, modified_bodies) = pipeline
+            .initialize_for_step_collisions_last(
+                &integration_parameters,
+                &mut islands,
+                &mut broad_phase,
+                &mut narrow_phase,
+                &mut bodies,
+                &mut colliders,
+                &mut impulse_joints,
+                &mut multibody_joints,
+                &(),
+                &(),
+            );
+
+        let (modified_colliders, removed_colliders, modified_bodies) = (0..60).fold(
+            (modified_colliders, removed_colliders, modified_bodies),
+            |(modified_colliders, removed_colliders, modified_bodies), _| {
+                pipeline.step_collisions_last(
+                    &gravity,
+                    &integration_parameters,
+                    &mut islands,
+                    &mut broad_phase,
+                    &mut narrow_phase,
+                    &mut bodies,
+                    &mut colliders,
+                    &mut impulse_joints,
+                    &mut multibody_joints,
+                    &mut ccd,
+                    &(),
+                    &(),
+                    modified_colliders,
+                    removed_colliders,
+                    modified_bodies,
+                )
+            },
+        );
+
+        // Now remove ball1 between steps. This should not cause a panic
+        // on the next step.
+        bodies.remove(
+            ball1,
+            &mut islands,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            true,
+        );
+
+        // This should NOT panic. Before the fix, it panicked with
+        // "No element at index" because the narrow phase still had stale
+        // contact pairs referencing ball1's removed colliders when
+        // update_active_set_with_contacts traversed the contact graph.
+        (0..10).fold(
+            (modified_colliders, removed_colliders, modified_bodies),
+            |(modified_colliders, removed_colliders, modified_bodies), _| {
+                pipeline.step_collisions_last(
+                    &gravity,
+                    &integration_parameters,
+                    &mut islands,
+                    &mut broad_phase,
+                    &mut narrow_phase,
+                    &mut bodies,
+                    &mut colliders,
+                    &mut impulse_joints,
+                    &mut multibody_joints,
+                    &mut ccd,
+                    &(),
+                    &(),
+                    modified_colliders,
+                    removed_colliders,
+                    modified_bodies,
+                )
+            },
+        );
+
+        // ball2 should still have a valid position.
+        let pos = bodies[ball2].translation().y;
+        assert!(pos.is_finite(), "Remaining body position should be finite");
     }
 }
