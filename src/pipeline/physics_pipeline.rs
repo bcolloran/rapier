@@ -47,6 +47,8 @@ pub struct PhysicsPipeline {
     broadphase_collider_pairs: Vec<ColliderPair>,
     broad_phase_events: Vec<BroadPhasePairEvent>,
     solvers: Vec<IslandSolver>,
+    /// Whether `step_collisions_last` has run its initial collision detection.
+    collisions_last_initialized: bool,
 }
 
 impl Default for PhysicsPipeline {
@@ -75,6 +77,7 @@ impl PhysicsPipeline {
             joint_constraint_indices: vec![],
             broadphase_collider_pairs: vec![],
             broad_phase_events: vec![],
+            collisions_last_initialized: false,
         }
     }
 
@@ -551,60 +554,6 @@ impl PhysicsPipeline {
         self.counters.step_completed();
     }
 
-    /// This function must be run once before the first call to `step_collisions_last_more_granular`
-    pub fn initialize_for_step_collisions_last(
-        &mut self,
-        integration_parameters: &IntegrationParameters,
-        islands: &mut IslandManager,
-        broad_phase: &mut BroadPhaseBvh,
-        narrow_phase: &mut NarrowPhase,
-        bodies: &mut RigidBodySet,
-        colliders: &mut ColliderSet,
-        impulse_joints: &mut ImpulseJointSet,
-        multibody_joints: &mut MultibodyJointSet,
-        hooks: &dyn PhysicsHooks,
-        events: &dyn EventHandler,
-    ) -> (
-        ModifiedObjects<ColliderHandle, Collider>,
-        Vec<ColliderHandle>,
-        ModifiedObjects<RigidBodyHandle, RigidBody>,
-    ) {
-        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
-            .user_changes_stage_part_1(
-                islands,
-                bodies,
-                colliders,
-                impulse_joints,
-                multibody_joints,
-            );
-
-        self.detect_collisions(
-            integration_parameters,
-            islands,
-            broad_phase,
-            narrow_phase,
-            bodies,
-            colliders,
-            impulse_joints,
-            multibody_joints,
-            &modified_colliders,
-            &removed_colliders,
-            hooks,
-            events,
-            true,
-        );
-
-        self.user_changes_stage_part_2(
-            bodies,
-            colliders,
-            &mut modified_colliders,
-            &mut removed_colliders,
-            &mut modified_bodies,
-        );
-
-        (modified_colliders, removed_colliders, modified_bodies)
-    }
-
     pub fn user_changes_stage_part_1(
         &mut self,
         islands: &mut IslandManager,
@@ -894,6 +843,17 @@ impl PhysicsPipeline {
         self.counters.stages.update_time.pause();
     }
 
+    /// Advances the simulation by one timestep, with collision detection at the end.
+    ///
+    /// Unlike [`step()`](Self::step), which detects collisions first and then integrates,
+    /// this method integrates first and then detects collisions. This ensures that
+    /// collision/contact data is up-to-date with the current body positions when the
+    /// method returns, so the caller can read accurate collision information between steps.
+    ///
+    /// On the first call, an initial collision detection pass is run automatically.
+    ///
+    /// This method has the same signature as [`step()`](Self::step) and can be used as a
+    /// drop-in replacement.
     pub fn step_collisions_last(
         &mut self,
         gravity: &Vector<Real>,
@@ -908,14 +868,45 @@ impl PhysicsPipeline {
         ccd_solver: &mut CCDSolver,
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
-        mut modified_colliders: ModifiedObjects<ColliderHandle, Collider>,
-        mut removed_colliders: Vec<ColliderHandle>,
-        mut modified_bodies: ModifiedObjects<RigidBodyHandle, RigidBody>,
-    ) -> (
-        ModifiedObjects<ColliderHandle, Collider>,
-        Vec<ColliderHandle>,
-        ModifiedObjects<RigidBodyHandle, RigidBody>,
     ) {
+        // On first call, run initial collision detection so that the
+        // substeps stage has valid contact data to work with.
+        if !self.collisions_last_initialized {
+            self.collisions_last_initialized = true;
+            let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
+                .user_changes_stage_part_1(
+                    islands,
+                    bodies,
+                    colliders,
+                    impulse_joints,
+                    multibody_joints,
+                );
+
+            self.detect_collisions(
+                integration_parameters,
+                islands,
+                broad_phase,
+                narrow_phase,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                &modified_colliders,
+                &removed_colliders,
+                hooks,
+                events,
+                true,
+            );
+
+            self.user_changes_stage_part_2(
+                bodies,
+                colliders,
+                &mut modified_colliders,
+                &mut removed_colliders,
+                &mut modified_bodies,
+            );
+        }
+
         self.counters.reset();
         self.counters.step_started();
 
@@ -948,9 +939,13 @@ impl PhysicsPipeline {
             );
         }
 
-        // Run integration substeps using the passed-in (empty) vectors for
-        // allocation reuse. These are separate from the user-change vectors
-        // above so that substeps' internal clear doesn't lose user-change data.
+        // Fresh scratch vectors for the substep stage. These are separate from
+        // the user-change vectors so that substeps' internal clear doesn't lose
+        // user-change data. The collider vector's allocation is preserved across
+        // calls via colliders.set_modified() below.
+        let mut modified_colliders = ModifiedObjects::default();
+        let mut modified_bodies = ModifiedObjects::default();
+
         self.substeps_stage(
             gravity,
             integration_parameters,
@@ -1002,12 +997,6 @@ impl PhysicsPipeline {
         );
 
         self.counters.step_completed();
-
-        (
-            user_modified_colliders,
-            user_removed_colliders,
-            user_modified_bodies,
-        )
     }
 }
 
@@ -1486,9 +1475,9 @@ mod test {
         let ball_collider = ColliderBuilder::ball(0.5).restitution(0.7).build();
         colliders.insert_with_parent(ball_collider, ball_handle, &mut bodies);
 
-        // Run the collision detection phase once before the loop.
-        let (modified_colliders, removed_colliders, modified_bodies) = pipeline
-            .initialize_for_step_collisions_last(
+        for _ in 0..100 {
+            pipeline.step_collisions_last(
+                &gravity,
                 &integration_parameters,
                 &mut islands,
                 &mut broad_phase,
@@ -1497,32 +1486,11 @@ mod test {
                 &mut colliders,
                 &mut impulse_joints,
                 &mut multibody_joints,
+                &mut ccd,
                 &(),
                 &(),
             );
-
-        (0..100).fold(
-            (modified_colliders, removed_colliders, modified_bodies),
-            |(modified_colliders, removed_colliders, modified_bodies), _| {
-                pipeline.step_collisions_last(
-                    &gravity,
-                    &integration_parameters,
-                    &mut islands,
-                    &mut broad_phase,
-                    &mut narrow_phase,
-                    &mut bodies,
-                    &mut colliders,
-                    &mut impulse_joints,
-                    &mut multibody_joints,
-                    &mut ccd,
-                    &(),
-                    &(),
-                    modified_colliders,
-                    removed_colliders,
-                    modified_bodies,
-                )
-            },
-        );
+        }
 
         // Verify the ball has fallen and is near the floor (not below it).
         let ball_pos = bodies[ball_handle].translation().y;
@@ -1645,8 +1613,9 @@ mod test {
             &mut bodies_b,
         );
 
-        let (modified_colliders, removed_colliders, modified_bodies) = pipeline_b
-            .initialize_for_step_collisions_last(
+        for _ in 0..100 {
+            pipeline_b.step_collisions_last(
+                &gravity,
                 &integration_parameters,
                 &mut islands_b,
                 &mut broad_phase_b,
@@ -1655,32 +1624,11 @@ mod test {
                 &mut colliders_b,
                 &mut impulse_joints_b,
                 &mut multibody_joints_b,
+                &mut ccd_b,
                 &(),
                 &(),
             );
-
-        (0..100).fold(
-            (modified_colliders, removed_colliders, modified_bodies),
-            |(modified_colliders, removed_colliders, modified_bodies), _| {
-                pipeline_b.step_collisions_last(
-                    &gravity,
-                    &integration_parameters,
-                    &mut islands_b,
-                    &mut broad_phase_b,
-                    &mut narrow_phase_b,
-                    &mut bodies_b,
-                    &mut colliders_b,
-                    &mut impulse_joints_b,
-                    &mut multibody_joints_b,
-                    &mut ccd_b,
-                    &(),
-                    &(),
-                    modified_colliders,
-                    removed_colliders,
-                    modified_bodies,
-                )
-            },
-        );
+        }
 
         // Both should produce similar results (ball resting on floor).
         let pos_a = bodies_a[ball_a].translation().y;
@@ -1735,8 +1683,9 @@ mod test {
             &mut bodies,
         );
 
-        let (modified_colliders, removed_colliders, modified_bodies) = pipeline
-            .initialize_for_step_collisions_last(
+        for _ in 0..10 {
+            pipeline.step_collisions_last(
+                &gravity,
                 &integration_parameters,
                 &mut islands,
                 &mut broad_phase,
@@ -1745,32 +1694,11 @@ mod test {
                 &mut colliders,
                 &mut impulse_joints,
                 &mut multibody_joints,
+                &mut ccd,
                 &(),
                 &(),
             );
-
-        let (modified_colliders, removed_colliders, modified_bodies) = (0..10).fold(
-            (modified_colliders, removed_colliders, modified_bodies),
-            |(modified_colliders, removed_colliders, modified_bodies), _| {
-                pipeline.step_collisions_last(
-                    &gravity,
-                    &integration_parameters,
-                    &mut islands,
-                    &mut broad_phase,
-                    &mut narrow_phase,
-                    &mut bodies,
-                    &mut colliders,
-                    &mut impulse_joints,
-                    &mut multibody_joints,
-                    &mut ccd,
-                    &(),
-                    &(),
-                    modified_colliders,
-                    removed_colliders,
-                    modified_bodies,
-                )
-            },
-        );
+        }
 
         // Now add a new dynamic body and a joint BETWEEN steps.
         // This is the scenario that triggers the bug.
@@ -1799,28 +1727,22 @@ mod test {
         // "index out of bounds: the len is N but the index is 18446744073709551615"
         // because substeps_stage ran before handle_user_changes_to_rigid_bodies
         // could add the new body to the active set.
-        (0..10).fold(
-            (modified_colliders, removed_colliders, modified_bodies),
-            |(modified_colliders, removed_colliders, modified_bodies), _| {
-                pipeline.step_collisions_last(
-                    &gravity,
-                    &integration_parameters,
-                    &mut islands,
-                    &mut broad_phase,
-                    &mut narrow_phase,
-                    &mut bodies,
-                    &mut colliders,
-                    &mut impulse_joints,
-                    &mut multibody_joints,
-                    &mut ccd,
-                    &(),
-                    &(),
-                    modified_colliders,
-                    removed_colliders,
-                    modified_bodies,
-                )
-            },
-        );
+        for _ in 0..10 {
+            pipeline.step_collisions_last(
+                &gravity,
+                &integration_parameters,
+                &mut islands,
+                &mut broad_phase,
+                &mut narrow_phase,
+                &mut bodies,
+                &mut colliders,
+                &mut impulse_joints,
+                &mut multibody_joints,
+                &mut ccd,
+                &(),
+                &(),
+            );
+        }
 
         // Verify both bodies have valid positions.
         let pos = bodies[new_body].translation().y;
@@ -1895,9 +1817,10 @@ mod test {
         );
         colliders.insert_with_parent(ColliderBuilder::ball(0.5).build(), ball2, &mut bodies);
 
-        // Initialize and run some steps so bodies fall and make contact.
-        let (modified_colliders, removed_colliders, modified_bodies) = pipeline
-            .initialize_for_step_collisions_last(
+        // Run some steps so bodies fall and make contact.
+        for _ in 0..60 {
+            pipeline.step_collisions_last(
+                &gravity,
                 &integration_parameters,
                 &mut islands,
                 &mut broad_phase,
@@ -1906,32 +1829,11 @@ mod test {
                 &mut colliders,
                 &mut impulse_joints,
                 &mut multibody_joints,
+                &mut ccd,
                 &(),
                 &(),
             );
-
-        let (modified_colliders, removed_colliders, modified_bodies) = (0..60).fold(
-            (modified_colliders, removed_colliders, modified_bodies),
-            |(modified_colliders, removed_colliders, modified_bodies), _| {
-                pipeline.step_collisions_last(
-                    &gravity,
-                    &integration_parameters,
-                    &mut islands,
-                    &mut broad_phase,
-                    &mut narrow_phase,
-                    &mut bodies,
-                    &mut colliders,
-                    &mut impulse_joints,
-                    &mut multibody_joints,
-                    &mut ccd,
-                    &(),
-                    &(),
-                    modified_colliders,
-                    removed_colliders,
-                    modified_bodies,
-                )
-            },
-        );
+        }
 
         // Now remove ball1 between steps. This should not cause a panic
         // on the next step.
@@ -1948,35 +1850,29 @@ mod test {
         // "No element at index" because the narrow phase still had stale
         // contact pairs referencing ball1's removed colliders when
         // update_active_set_with_contacts traversed the contact graph.
-        (0..10).fold(
-            (modified_colliders, removed_colliders, modified_bodies),
-            |(modified_colliders, removed_colliders, modified_bodies), _| {
-                pipeline.step_collisions_last(
-                    &gravity,
-                    &integration_parameters,
-                    &mut islands,
-                    &mut broad_phase,
-                    &mut narrow_phase,
-                    &mut bodies,
-                    &mut colliders,
-                    &mut impulse_joints,
-                    &mut multibody_joints,
-                    &mut ccd,
-                    &(),
-                    &(),
-                    modified_colliders,
-                    removed_colliders,
-                    modified_bodies,
-                )
-            },
-        );
+        for _ in 0..10 {
+            pipeline.step_collisions_last(
+                &gravity,
+                &integration_parameters,
+                &mut islands,
+                &mut broad_phase,
+                &mut narrow_phase,
+                &mut bodies,
+                &mut colliders,
+                &mut impulse_joints,
+                &mut multibody_joints,
+                &mut ccd,
+                &(),
+                &(),
+            );
+        }
 
         // ball2 should still have a valid position.
         let pos = bodies[ball2].translation().y;
         assert!(pos.is_finite(), "Remaining body position should be finite");
     }
 
-    /// Helper: run N steps using step_collisions_last, handling initialization.
+    /// Helper: run N steps using step_collisions_last.
     fn run_step_collisions_last(
         pipeline: &mut PhysicsPipeline,
         gravity: &Vector<crate::math::Real>,
@@ -1991,20 +1887,7 @@ mod test {
         ccd: &mut CCDSolver,
         n: usize,
     ) {
-        let init = pipeline.initialize_for_step_collisions_last(
-            integration_parameters,
-            islands,
-            broad_phase,
-            narrow_phase,
-            bodies,
-            colliders,
-            impulse_joints,
-            multibody_joints,
-            &(),
-            &(),
-        );
-
-        (0..n).fold(init, |(mc, rc, mb), _| {
+        for _ in 0..n {
             pipeline.step_collisions_last(
                 gravity,
                 integration_parameters,
@@ -2018,11 +1901,8 @@ mod test {
                 ccd,
                 &(),
                 &(),
-                mc,
-                rc,
-                mb,
-            )
-        });
+            );
+        }
     }
 
     #[test]
@@ -2177,20 +2057,7 @@ mod test {
         let h = bodies.insert(rb);
 
         // Step once with step_collisions_last.
-        let init = pipeline.initialize_for_step_collisions_last(
-            &params,
-            &mut islands,
-            &mut bf,
-            &mut nf,
-            &mut bodies,
-            &mut colliders,
-            &mut impulse_joints,
-            &mut multibody_joints,
-            &(),
-            &(),
-        );
-
-        let (mc, rc, mb) = pipeline.step_collisions_last(
+        pipeline.step_collisions_last(
             &gravity,
             &params,
             &mut islands,
@@ -2203,9 +2070,6 @@ mod test {
             &mut ccd,
             &(),
             &(),
-            init.0,
-            init.1,
-            init.2,
         );
 
         // Switch body type to Dynamic.
@@ -2228,9 +2092,6 @@ mod test {
             &mut ccd,
             &(),
             &(),
-            mc,
-            rc,
-            mb,
         );
 
         let body = bodies.get(h).unwrap();
@@ -2334,21 +2195,8 @@ mod test {
         let mut multibody_joint_set = MultibodyJointSet::new();
         let mut ccd_solver = CCDSolver::new();
 
-        // Initialize and step once.
-        let init = physics_pipeline.initialize_for_step_collisions_last(
-            &integration_parameters,
-            &mut island_manager,
-            &mut broad_phase,
-            &mut narrow_phase,
-            &mut rigid_body_set,
-            &mut collider_set,
-            &mut impulse_joint_set,
-            &mut multibody_joint_set,
-            &(),
-            &(),
-        );
-
-        let (mc, rc, mb) = physics_pipeline.step_collisions_last(
+        // Step once.
+        physics_pipeline.step_collisions_last(
             &gravity,
             &integration_parameters,
             &mut island_manager,
@@ -2361,9 +2209,6 @@ mod test {
             &mut ccd_solver,
             &(),
             &(),
-            init.0,
-            init.1,
-            init.2,
         );
 
         // Test disable.
@@ -2374,7 +2219,7 @@ mod test {
             ball_body.set_enabled(false);
         }
 
-        let (mc, rc, mb) = physics_pipeline.step_collisions_last(
+        physics_pipeline.step_collisions_last(
             &gravity,
             &integration_parameters,
             &mut island_manager,
@@ -2387,9 +2232,6 @@ mod test {
             &mut ccd_solver,
             &(),
             &(),
-            mc,
-            rc,
-            mb,
         );
 
         // Test re-enable.
@@ -2413,9 +2255,6 @@ mod test {
             &mut ccd_solver,
             &(),
             &(),
-            mc,
-            rc,
-            mb,
         );
     }
 }

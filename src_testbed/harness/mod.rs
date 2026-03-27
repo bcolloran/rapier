@@ -5,14 +5,11 @@ use crate::{
     physics::{PhysicsEvents, PhysicsState},
 };
 use plugin::HarnessPlugin;
-use rapier::data::ModifiedObjects;
 use rapier::dynamics::{
-    CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet, RigidBody,
-    RigidBodyHandle, RigidBodySet,
+    CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet,
+    RigidBodySet,
 };
-use rapier::geometry::{
-    BroadPhaseBvh, BvhOptimizationStrategy, Collider, ColliderHandle, ColliderSet, NarrowPhase,
-};
+use rapier::geometry::{BroadPhaseBvh, BvhOptimizationStrategy, ColliderSet, NarrowPhase};
 use rapier::math::{Real, Vector};
 use rapier::pipeline::{ChannelEventCollector, PhysicsHooks, PhysicsPipeline};
 
@@ -101,12 +98,6 @@ impl RunState {
     }
 }
 
-type CollisionsLastState = (
-    ModifiedObjects<ColliderHandle, Collider>,
-    Vec<ColliderHandle>,
-    ModifiedObjects<RigidBodyHandle, RigidBody>,
-);
-
 pub struct Harness {
     pub physics: PhysicsState,
     max_steps: usize,
@@ -116,7 +107,6 @@ pub struct Harness {
     event_handler: ChannelEventCollector,
     pub state: RunState,
     pub use_step_collisions_last: bool,
-    collisions_last_state: Option<CollisionsLastState>,
 }
 
 type Callbacks =
@@ -145,7 +135,6 @@ impl Harness {
             event_handler,
             state,
             use_step_collisions_last: false,
-            collisions_last_state: None,
         }
     }
 
@@ -229,7 +218,6 @@ impl Harness {
         self.physics.ccd_solver = CCDSolver::new();
         self.physics.pipeline = PhysicsPipeline::new();
         self.physics.pipeline.counters.enable();
-        self.collisions_last_state = None;
     }
 
     pub fn add_plugin(&mut self, plugin: impl HarnessPlugin + 'static) {
@@ -321,23 +309,7 @@ impl Harness {
     }
 
     fn step_collisions_last_impl(&mut self) {
-        let (modified_colliders, removed_colliders, modified_bodies) =
-            self.collisions_last_state.take().unwrap_or_else(|| {
-                self.physics.pipeline.initialize_for_step_collisions_last(
-                    &self.physics.integration_parameters,
-                    &mut self.physics.islands,
-                    &mut self.physics.broad_phase,
-                    &mut self.physics.narrow_phase,
-                    &mut self.physics.bodies,
-                    &mut self.physics.colliders,
-                    &mut self.physics.impulse_joints,
-                    &mut self.physics.multibody_joints,
-                    &*self.physics.hooks,
-                    &self.event_handler,
-                )
-            });
-
-        let new_state = self.physics.pipeline.step_collisions_last(
+        self.physics.pipeline.step_collisions_last(
             &self.physics.gravity,
             &self.physics.integration_parameters,
             &mut self.physics.islands,
@@ -350,12 +322,7 @@ impl Harness {
             &mut self.physics.ccd_solver,
             &*self.physics.hooks,
             &self.event_handler,
-            modified_colliders,
-            removed_colliders,
-            modified_bodies,
         );
-
-        self.collisions_last_state = Some(new_state);
     }
 
     pub fn run(&mut self) {
