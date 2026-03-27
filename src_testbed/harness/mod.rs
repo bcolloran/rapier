@@ -7,8 +7,8 @@ use crate::{
 use plugin::HarnessPlugin;
 use rapier::data::ModifiedObjects;
 use rapier::dynamics::{
-    CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet,
-    RigidBody, RigidBodyHandle, RigidBodySet,
+    CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet, RigidBody,
+    RigidBodyHandle, RigidBodySet,
 };
 use rapier::geometry::{
     BroadPhaseBvh, BvhOptimizationStrategy, Collider, ColliderHandle, ColliderSet, NarrowPhase,
@@ -321,10 +321,8 @@ impl Harness {
     }
 
     fn step_collisions_last_impl(&mut self) {
-        let (modified_colliders, removed_colliders, modified_bodies) = self
-            .collisions_last_state
-            .take()
-            .unwrap_or_else(|| {
+        let (modified_colliders, removed_colliders, modified_bodies) =
+            self.collisions_last_state.take().unwrap_or_else(|| {
                 self.physics.pipeline.initialize_for_step_collisions_last(
                     &self.physics.integration_parameters,
                     &mut self.physics.islands,

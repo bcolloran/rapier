@@ -351,6 +351,14 @@ impl TestbedApp {
             let backend_names = self.state.backend_names.clone();
 
             let collisions_last_name = "rapier (collisions last)";
+            let mut summary_lines: Vec<String> = Vec::new();
+            summary_lines
+                .push("Benchmark Summary: rapier step() vs step_collisions_last()".to_string());
+            summary_lines.push(format!(
+                "Iterations per benchmark: {} (first skipped as warmup)\n",
+                num_bench_iters
+            ));
+            summary_lines.push(String::new());
 
             for builder in builders {
                 results.clear();
@@ -461,6 +469,81 @@ impl TestbedApp {
                     }
                     writeln!(file).unwrap();
                 }
+
+                // Compute summary statistics for rapier vs collisions_last.
+                let rapier_idx = 0;
+                let collisions_last_idx = results.len() - 1;
+                let rapier_timings = &results[rapier_idx];
+                let cl_timings = &results[collisions_last_idx];
+
+                if !rapier_timings.is_empty() && !cl_timings.is_empty() {
+                    let (r_mean, r_std, r_med, r_q1, r_q3) = compute_stats(rapier_timings);
+                    let (c_mean, c_std, c_med, c_q1, c_q3) = compute_stats(cl_timings);
+                    let (t_stat, df, p_value) =
+                        welch_t_test(rapier_timings, cl_timings, r_mean, c_mean, r_std, c_std);
+                    let n = rapier_timings.len();
+                    let pct_diff = if r_mean.abs() > 1e-12 {
+                        (c_mean - r_mean) / r_mean * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    summary_lines.push(format!("=== {} ===", builder.0));
+                    summary_lines.push(format!("  N = {n}"));
+                    summary_lines.push(String::new());
+                    summary_lines.push(format!(
+                        "  {:30} {:>12} {:>12}",
+                        "", "step()", "step_collisions_last()"
+                    ));
+                    summary_lines.push(format!(
+                        "  {:30} {:>12.4} {:>12.4}",
+                        "Mean (ms):", r_mean, c_mean
+                    ));
+                    summary_lines.push(format!(
+                        "  {:30} {:>12.4} {:>12.4}",
+                        "Std Dev (ms):", r_std, c_std
+                    ));
+                    summary_lines.push(format!(
+                        "  {:30} {:>12.4} {:>12.4}",
+                        "Median (ms):", r_med, c_med
+                    ));
+                    summary_lines
+                        .push(format!("  {:30} {:>12.4} {:>12.4}", "Q1 (ms):", r_q1, c_q1));
+                    summary_lines
+                        .push(format!("  {:30} {:>12.4} {:>12.4}", "Q3 (ms):", r_q3, c_q3));
+                    summary_lines.push(format!(
+                        "  {:30} {:>12.4} {:>12.4}",
+                        "IQR (ms):",
+                        r_q3 - r_q1,
+                        c_q3 - c_q1
+                    ));
+                    summary_lines.push(String::new());
+                    summary_lines.push(format!(
+                        "  Difference: {pct_diff:+.2}% (collisions_last vs step)"
+                    ));
+                    summary_lines.push(format!(
+                        "  Welch's t = {t_stat:.4}, df = {df:.1}, p = {p_value:.6}"
+                    ));
+                    let sig = if p_value < 0.01 {
+                        "YES (p < 0.01)"
+                    } else if p_value < 0.05 {
+                        "YES (p < 0.05)"
+                    } else {
+                        "NO (p >= 0.05)"
+                    };
+                    summary_lines.push(format!("  Statistically significant: {sig}"));
+                    summary_lines.push(String::new());
+                }
+            }
+
+            // Write the summary file.
+            {
+                let summary_path = "benchmark_summary.txt";
+                let mut file = BufWriter::new(File::create(summary_path).unwrap());
+                for line in &summary_lines {
+                    writeln!(file, "{line}").unwrap();
+                }
+                println!("Summary written to {summary_path}");
             }
         } else {
             let title = if cfg!(feature = "dim2") {
@@ -1612,4 +1695,171 @@ fn highlight_hovered_body(
             }
         }
     }
+}
+
+/// Returns (mean, std_dev, median, q1, q3) for the given data.
+fn compute_stats(data: &[f64]) -> (f64, f64, f64, f64, f64) {
+    let n = data.len() as f64;
+    let mean = data.iter().sum::<f64>() / n;
+    let variance = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let std_dev = variance.sqrt();
+
+    let mut sorted = data.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = percentile_sorted(&sorted, 50.0);
+    let q1 = percentile_sorted(&sorted, 25.0);
+    let q3 = percentile_sorted(&sorted, 75.0);
+
+    (mean, std_dev, median, q1, q3)
+}
+
+/// Linear interpolation percentile on already-sorted data.
+fn percentile_sorted(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = pct / 100.0 * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = lo + 1;
+    let frac = rank - lo as f64;
+    if hi >= sorted.len() {
+        sorted[lo]
+    } else {
+        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    }
+}
+
+/// Welch's t-test for two independent samples with unequal variances.
+/// Returns (t_statistic, degrees_of_freedom, p_value).
+fn welch_t_test(
+    a: &[f64],
+    b: &[f64],
+    mean_a: f64,
+    mean_b: f64,
+    std_a: f64,
+    std_b: f64,
+) -> (f64, f64, f64) {
+    let n_a = a.len() as f64;
+    let n_b = b.len() as f64;
+    let var_a = std_a * std_a;
+    let var_b = std_b * std_b;
+    let se = (var_a / n_a + var_b / n_b).sqrt();
+
+    if se < 1e-15 {
+        return (0.0, n_a + n_b - 2.0, 1.0);
+    }
+
+    let t = (mean_a - mean_b) / se;
+
+    // Welch-Satterthwaite degrees of freedom.
+    let num = (var_a / n_a + var_b / n_b).powi(2);
+    let denom = (var_a / n_a).powi(2) / (n_a - 1.0) + (var_b / n_b).powi(2) / (n_b - 1.0);
+    let df = num / denom;
+
+    // Two-tailed p-value via regularized incomplete beta function.
+    let p = two_tailed_t_p_value(t.abs(), df);
+    (t, df, p)
+}
+
+/// Approximate two-tailed p-value for Student's t distribution.
+/// p = I_{df/(df+t^2)}(df/2, 1/2)  where I is the regularized incomplete beta.
+fn two_tailed_t_p_value(t_abs: f64, df: f64) -> f64 {
+    let x = df / (df + t_abs * t_abs);
+    regularized_incomplete_beta(x, df / 2.0, 0.5)
+}
+
+/// Regularized incomplete beta function I_x(a, b) via continued fraction (Lentz).
+fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+
+    // Use the symmetry relation if needed for better convergence.
+    if x > (a + 1.0) / (a + b + 2.0) {
+        return 1.0 - regularized_incomplete_beta(1.0 - x, b, a);
+    }
+
+    let ln_prefix = a * x.ln() + b * (1.0 - x).ln() - ln_beta(a, b) - a.ln();
+    let prefix = ln_prefix.exp();
+
+    // Lentz's continued fraction.
+    let mut f = 1.0_f64;
+    let mut c = 1.0_f64;
+    let mut d: f64;
+
+    let max_iter = 200;
+    let eps = 1e-14;
+    let tiny = 1e-30;
+
+    d = 1.0 - (a + b) * x / (a + 1.0);
+    if d.abs() < tiny {
+        d = tiny;
+    }
+    d = 1.0 / d;
+    f = d;
+
+    for m in 1..=max_iter {
+        let m_f = m as f64;
+
+        // Even step: d_{2m}
+        let num_even = m_f * (b - m_f) * x / ((a + 2.0 * m_f - 1.0) * (a + 2.0 * m_f));
+        d = 1.0 + num_even * d;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = 1.0 + num_even / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        f *= c * d;
+
+        // Odd step: d_{2m+1}
+        let num_odd = -(a + m_f) * (a + b + m_f) * x / ((a + 2.0 * m_f) * (a + 2.0 * m_f + 1.0));
+        d = 1.0 + num_odd * d;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = 1.0 + num_odd / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        let delta = c * d;
+        f *= delta;
+
+        if (delta - 1.0).abs() < eps {
+            break;
+        }
+    }
+
+    prefix * f
+}
+
+/// ln(Beta(a,b)) = ln(Gamma(a)) + ln(Gamma(b)) - ln(Gamma(a+b))
+fn ln_beta(a: f64, b: f64) -> f64 {
+    ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b)
+}
+
+/// Lanczos approximation for ln(Gamma(x)).
+fn ln_gamma(x: f64) -> f64 {
+    let coeffs = [
+        76.18009172947146,
+        -86.50532032941677,
+        24.01409824083091,
+        -1.231739572450155,
+        0.1208650973866179e-2,
+        -0.5395239384953e-5,
+    ];
+    let y = x;
+    let tmp = x + 5.5;
+    let tmp = tmp - (x + 0.5) * tmp.ln();
+    let mut ser = 1.000000000190015_f64;
+    for (i, &c) in coeffs.iter().enumerate() {
+        ser += c / (y + 1.0 + i as f64);
+    }
+    -tmp + (2.5066282746310005 * ser / x).ln()
 }
