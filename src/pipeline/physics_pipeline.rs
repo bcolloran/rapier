@@ -425,6 +425,186 @@ impl PhysicsPipeline {
         }
     }
 
+    /// Advances the physics simulation by one timestep.
+    ///
+    /// This is the main function you'll call every frame in your game loop. It performs all
+    /// physics calculations: collision detection, constraint solving, and updating object positions.
+    ///
+    /// # Parameters
+    ///
+    /// * `gravity` - The gravity vector applied to all dynamic bodies (e.g., `vector![0.0, -9.81, 0.0]` for Earth gravity pointing down)
+    /// * `integration_parameters` - Controls the simulation quality and timestep size (typically 60 Hz = 1/60 second per step)
+    /// * `islands` - Internal system that groups connected objects together for efficient solving (automatically managed)
+    /// * `broad_phase` - Fast collision detection phase that filters out distant object pairs (automatically managed)
+    /// * `narrow_phase` - Precise collision detection that computes exact contact points (automatically managed)
+    /// * `bodies` - Your collection of rigid bodies (the physical objects that move and collide)
+    /// * `colliders` - The collision shapes attached to your bodies (boxes, spheres, meshes, etc.)
+    /// * `impulse_joints` - Regular joints connecting bodies (hinges, sliders, etc.)
+    /// * `multibody_joints` - Articulated joints for robot-like structures (optional, can be empty)
+    /// * `ccd_solver` - Continuous collision detection to prevent fast objects from tunneling through thin walls
+    /// * `hooks` - Optional callbacks to customize collision filtering and contact modification
+    /// * `events` - Optional handler to receive collision events (when objects start/stop touching)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use rapier3d::prelude::*;
+    /// # let mut bodies = RigidBodySet::new();
+    /// # let mut colliders = ColliderSet::new();
+    /// # let mut impulse_joints = ImpulseJointSet::new();
+    /// # let mut multibody_joints = MultibodyJointSet::new();
+    /// # let mut islands = IslandManager::new();
+    /// # let mut broad_phase = BroadPhaseBvh::new();
+    /// # let mut narrow_phase = NarrowPhase::new();
+    /// # let mut ccd_solver = CCDSolver::new();
+    /// # let mut physics_pipeline = PhysicsPipeline::new();
+    /// # let integration_parameters = IntegrationParameters::default();
+    /// // In your game loop:
+    /// physics_pipeline.step(
+    ///     &vector![0.0, -9.81, 0.0],  // Gravity pointing down
+    ///     &integration_parameters,
+    ///     &mut islands,
+    ///     &mut broad_phase,
+    ///     &mut narrow_phase,
+    ///     &mut bodies,
+    ///     &mut colliders,
+    ///     &mut impulse_joints,
+    ///     &mut multibody_joints,
+    ///     &mut ccd_solver,
+    ///     &(),  // No custom hooks
+    ///     &(),  // No event handler
+    /// );
+    /// ``
+    pub fn step(
+        &mut self,
+        gravity: &Vector<Real>,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.counters.reset();
+        self.counters.step_started();
+
+        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
+            .user_changes_stage_part_1(
+                islands,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+            );
+
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            true,
+        );
+
+        self.user_changes_stage_part_2(
+            bodies,
+            colliders,
+            &mut modified_colliders,
+            &mut removed_colliders,
+            &mut modified_bodies,
+        );
+
+        self.substeps_stage(
+            gravity,
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            ccd_solver,
+            hooks,
+            events,
+            &mut modified_colliders,
+            &mut modified_bodies,
+        );
+
+        self.update_mass_properties_of_moved_bodies_stage(islands, bodies);
+
+        // Re-insert the modified vector we extracted for the borrow-checker.
+        colliders.set_modified(modified_colliders);
+
+        self.counters.step_completed();
+    }
+
+    /// This function must be run once before the first call to `step_collisions_last_more_granular`
+    pub fn initialize_for_step_collisions_last(
+        &mut self,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) -> (
+        ModifiedObjects<ColliderHandle, Collider>,
+        Vec<ColliderHandle>,
+        ModifiedObjects<RigidBodyHandle, RigidBody>,
+    ) {
+        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
+            .user_changes_stage_part_1(
+                islands,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+            );
+
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            true,
+        );
+
+        self.user_changes_stage_part_2(
+            bodies,
+            colliders,
+            &mut modified_colliders,
+            &mut removed_colliders,
+            &mut modified_bodies,
+        );
+
+        (modified_colliders, removed_colliders, modified_bodies)
+    }
+
     pub fn user_changes_stage_part_1(
         &mut self,
         islands: &mut IslandManager,
@@ -712,137 +892,6 @@ impl PhysicsPipeline {
                 .update_world_mass_properties(rb.body_type, &rb.pos.position);
         }
         self.counters.stages.update_time.pause();
-    }
-
-    /// TODO no docs yet
-    pub fn step(
-        &mut self,
-        gravity: &Vector<Real>,
-        integration_parameters: &IntegrationParameters,
-        islands: &mut IslandManager,
-        broad_phase: &mut BroadPhaseBvh,
-        narrow_phase: &mut NarrowPhase,
-        bodies: &mut RigidBodySet,
-        colliders: &mut ColliderSet,
-        impulse_joints: &mut ImpulseJointSet,
-        multibody_joints: &mut MultibodyJointSet,
-        ccd_solver: &mut CCDSolver,
-        hooks: &dyn PhysicsHooks,
-        events: &dyn EventHandler,
-    ) {
-        self.counters.reset();
-        self.counters.step_started();
-
-        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
-            .user_changes_stage_part_1(
-                islands,
-                bodies,
-                colliders,
-                impulse_joints,
-                multibody_joints,
-            );
-
-        self.detect_collisions(
-            integration_parameters,
-            islands,
-            broad_phase,
-            narrow_phase,
-            bodies,
-            colliders,
-            impulse_joints,
-            multibody_joints,
-            &modified_colliders,
-            &removed_colliders,
-            hooks,
-            events,
-            true,
-        );
-
-        self.user_changes_stage_part_2(
-            bodies,
-            colliders,
-            &mut modified_colliders,
-            &mut removed_colliders,
-            &mut modified_bodies,
-        );
-
-        self.substeps_stage(
-            gravity,
-            integration_parameters,
-            islands,
-            broad_phase,
-            narrow_phase,
-            bodies,
-            colliders,
-            impulse_joints,
-            multibody_joints,
-            ccd_solver,
-            hooks,
-            events,
-            &mut modified_colliders,
-            &mut modified_bodies,
-        );
-
-        self.update_mass_properties_of_moved_bodies_stage(islands, bodies);
-
-        // Re-insert the modified vector we extracted for the borrow-checker.
-        colliders.set_modified(modified_colliders);
-
-        self.counters.step_completed();
-    }
-
-    /// This function must be run once before the first call to `step_collisions_last_more_granular`
-    pub fn initialize_for_step_collisions_last(
-        &mut self,
-        integration_parameters: &IntegrationParameters,
-        islands: &mut IslandManager,
-        broad_phase: &mut BroadPhaseBvh,
-        narrow_phase: &mut NarrowPhase,
-        bodies: &mut RigidBodySet,
-        colliders: &mut ColliderSet,
-        impulse_joints: &mut ImpulseJointSet,
-        multibody_joints: &mut MultibodyJointSet,
-        hooks: &dyn PhysicsHooks,
-        events: &dyn EventHandler,
-    ) -> (
-        ModifiedObjects<ColliderHandle, Collider>,
-        Vec<ColliderHandle>,
-        ModifiedObjects<RigidBodyHandle, RigidBody>,
-    ) {
-        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
-            .user_changes_stage_part_1(
-                islands,
-                bodies,
-                colliders,
-                impulse_joints,
-                multibody_joints,
-            );
-
-        self.detect_collisions(
-            integration_parameters,
-            islands,
-            broad_phase,
-            narrow_phase,
-            bodies,
-            colliders,
-            impulse_joints,
-            multibody_joints,
-            &modified_colliders,
-            &removed_colliders,
-            hooks,
-            events,
-            true,
-        );
-
-        self.user_changes_stage_part_2(
-            bodies,
-            colliders,
-            &mut modified_colliders,
-            &mut removed_colliders,
-            &mut modified_bodies,
-        );
-
-        (modified_colliders, removed_colliders, modified_bodies)
     }
 
     pub fn step_collisions_last(
