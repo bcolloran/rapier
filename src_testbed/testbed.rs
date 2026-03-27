@@ -373,6 +373,7 @@ impl TestbedApp {
                         .num_solver_iterations = 4;
 
                     // Init world.
+                    self.harness.clear_callbacks();
                     let mut testbed = Testbed {
                         graphics: None,
                         state: &mut self.state,
@@ -428,6 +429,7 @@ impl TestbedApp {
                     self.harness.use_step_collisions_last = true;
 
                     // Re-init world.
+                    self.harness.clear_callbacks();
                     let mut testbed = Testbed {
                         graphics: None,
                         state: &mut self.state,
@@ -470,7 +472,7 @@ impl TestbedApp {
                     writeln!(file).unwrap();
                 }
 
-                // Compute summary statistics for rapier vs collisions_last.
+                // Compute summary statistics for `step()` vs `step_collisions_last()`.
                 let rapier_idx = 0;
                 let collisions_last_idx = results.len() - 1;
                 let rapier_timings = &results[rapier_idx];

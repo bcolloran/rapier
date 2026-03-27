@@ -1975,4 +1975,447 @@ mod test {
         let pos = bodies[ball2].translation().y;
         assert!(pos.is_finite(), "Remaining body position should be finite");
     }
+
+    /// Helper: run N steps using step_collisions_last, handling initialization.
+    fn run_step_collisions_last(
+        pipeline: &mut PhysicsPipeline,
+        gravity: &Vector<crate::math::Real>,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd: &mut CCDSolver,
+        n: usize,
+    ) {
+        let init = pipeline.initialize_for_step_collisions_last(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &(),
+            &(),
+        );
+
+        (0..n).fold(init, |(mc, rc, mb), _| {
+            pipeline.step_collisions_last(
+                gravity,
+                integration_parameters,
+                islands,
+                broad_phase,
+                narrow_phase,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                ccd,
+                &(),
+                &(),
+                mc,
+                rc,
+                mb,
+            )
+        });
+    }
+
+    #[test]
+    fn step_collisions_last_kinematic_and_fixed_contact_crash() {
+        let mut colliders = ColliderSet::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut pipeline = PhysicsPipeline::new();
+        let mut bf = BroadPhaseBvh::new();
+        let mut nf = NarrowPhase::new();
+        let mut bodies = RigidBodySet::new();
+        let mut islands = IslandManager::new();
+        let mut ccd = CCDSolver::new();
+
+        let rb = RigidBodyBuilder::fixed().build();
+        let h1 = bodies.insert(rb.clone());
+        let co = ColliderBuilder::ball(10.0).build();
+        colliders.insert_with_parent(co.clone(), h1, &mut bodies);
+
+        let rb = RigidBodyBuilder::kinematic_position_based().build();
+        let h2 = bodies.insert(rb.clone());
+        colliders.insert_with_parent(co, h2, &mut bodies);
+
+        run_step_collisions_last(
+            &mut pipeline,
+            &Vector::zeros(),
+            &IntegrationParameters::default(),
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            &mut ccd,
+            1,
+        );
+    }
+
+    #[test]
+    fn step_collisions_last_rigid_body_removal_before_step() {
+        let mut colliders = ColliderSet::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut pipeline = PhysicsPipeline::new();
+        let mut bf = BroadPhaseBvh::new();
+        let mut nf = NarrowPhase::new();
+        let mut islands = IslandManager::new();
+        let mut ccd = CCDSolver::new();
+        let mut bodies = RigidBodySet::new();
+
+        let rb = RigidBodyBuilder::dynamic().build();
+        let h1 = bodies.insert(rb.clone());
+        let h2 = bodies.insert(rb.clone());
+
+        let rb = RigidBodyBuilder::kinematic_position_based().build();
+        let h3 = bodies.insert(rb.clone());
+
+        let rb = RigidBodyBuilder::fixed().build();
+        let h4 = bodies.insert(rb.clone());
+
+        let to_delete = [h1, h2, h3, h4];
+        for h in &to_delete {
+            bodies.remove(
+                *h,
+                &mut islands,
+                &mut colliders,
+                &mut impulse_joints,
+                &mut multibody_joints,
+                true,
+            );
+        }
+
+        run_step_collisions_last(
+            &mut pipeline,
+            &Vector::zeros(),
+            &IntegrationParameters::default(),
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            &mut ccd,
+            1,
+        );
+    }
+
+    #[test]
+    fn step_collisions_last_collider_removal_before_step() {
+        let mut pipeline = PhysicsPipeline::new();
+        let gravity = Vector::y() * -9.81;
+        let integration_parameters = IntegrationParameters::default();
+        let mut broad_phase = BroadPhaseBvh::new();
+        let mut narrow_phase = NarrowPhase::new();
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut ccd = CCDSolver::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut islands = IslandManager::new();
+
+        let body = RigidBodyBuilder::dynamic().build();
+        let b_handle = bodies.insert(body);
+        let collider = ColliderBuilder::ball(1.0).build();
+        let c_handle = colliders.insert_with_parent(collider, b_handle, &mut bodies);
+        colliders.remove(c_handle, &mut islands, &mut bodies, true);
+        bodies.remove(
+            b_handle,
+            &mut islands,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            true,
+        );
+
+        run_step_collisions_last(
+            &mut pipeline,
+            &gravity,
+            &integration_parameters,
+            &mut islands,
+            &mut broad_phase,
+            &mut narrow_phase,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            &mut ccd,
+            10,
+        );
+    }
+
+    #[test]
+    fn step_collisions_last_rigid_body_type_changed_dynamic_is_in_active_set() {
+        let mut colliders = ColliderSet::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut pipeline = PhysicsPipeline::new();
+        let mut bf = BroadPhaseBvh::new();
+        let mut nf = NarrowPhase::new();
+        let mut islands = IslandManager::new();
+        let mut ccd = CCDSolver::new();
+        let mut bodies = RigidBodySet::new();
+        let gravity = Vector::y() * -9.81;
+        let params = IntegrationParameters::default();
+
+        // Initialize body as kinematic with mass.
+        let rb = RigidBodyBuilder::kinematic_position_based()
+            .additional_mass(1.0)
+            .build();
+        let h = bodies.insert(rb);
+
+        // Step once with step_collisions_last.
+        let init = pipeline.initialize_for_step_collisions_last(
+            &params,
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            &(),
+            &(),
+        );
+
+        let (mc, rc, mb) = pipeline.step_collisions_last(
+            &gravity,
+            &params,
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            &mut ccd,
+            &(),
+            &(),
+            init.0,
+            init.1,
+            init.2,
+        );
+
+        // Switch body type to Dynamic.
+        bodies
+            .get_mut(h)
+            .unwrap()
+            .set_body_type(RigidBodyType::Dynamic, true);
+
+        // Step again.
+        pipeline.step_collisions_last(
+            &gravity,
+            &params,
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            &mut ccd,
+            &(),
+            &(),
+            mc,
+            rc,
+            mb,
+        );
+
+        let body = bodies.get(h).unwrap();
+        let h_y = body.pos.position.translation.y;
+
+        // Expect gravity to be applied after switching to Dynamic.
+        assert!(h_y < 0.0);
+
+        // Expect body to now be in active_set.
+        assert!(islands.active_set.contains(&h));
+    }
+
+    #[test]
+    fn step_collisions_last_joint_step_delta_time_0() {
+        let mut colliders = ColliderSet::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut pipeline = PhysicsPipeline::new();
+        let mut bf = BroadPhaseBvh::new();
+        let mut nf = NarrowPhase::new();
+        let mut islands = IslandManager::new();
+        let mut ccd = CCDSolver::new();
+        let mut bodies = RigidBodySet::new();
+
+        let rb = RigidBodyBuilder::fixed().additional_mass(1.0).build();
+        let h = bodies.insert(rb);
+        let rb_dynamic = RigidBodyBuilder::dynamic().additional_mass(1.0).build();
+        let h_dynamic = bodies.insert(rb_dynamic);
+
+        #[cfg(feature = "dim2")]
+        let joint = RevoluteJointBuilder::new()
+            .local_anchor1(point![0.0, 1.0])
+            .local_anchor2(point![0.0, -3.0]);
+        #[cfg(feature = "dim3")]
+        let joint = RevoluteJointBuilder::new(Vector::z_axis())
+            .local_anchor1(point![0.0, 1.0, 0.0])
+            .local_anchor2(point![0.0, -3.0, 0.0]);
+        impulse_joints.insert(h, h_dynamic, joint, true);
+
+        let parameters = IntegrationParameters {
+            dt: 0.0,
+            ..Default::default()
+        };
+        let gravity = Vector::y() * -9.81;
+
+        run_step_collisions_last(
+            &mut pipeline,
+            &gravity,
+            &parameters,
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            &mut ccd,
+            1,
+        );
+
+        let translation = bodies[h_dynamic].translation();
+        let rotation = bodies[h_dynamic].rotation();
+        assert!(translation.x.is_finite());
+        assert!(translation.y.is_finite());
+        #[cfg(feature = "dim2")]
+        assert!(rotation.is_finite());
+        #[cfg(feature = "dim3")]
+        {
+            assert!(translation.z.is_finite());
+            assert!(rotation.i.is_finite());
+            assert!(rotation.j.is_finite());
+            assert!(rotation.k.is_finite());
+            assert!(rotation.w.is_finite());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dim2")]
+    fn step_collisions_last_multi_sap_disable_body() {
+        use na::vector;
+        let mut rigid_body_set = RigidBodySet::new();
+        let mut collider_set = ColliderSet::new();
+
+        let collider = ColliderBuilder::cuboid(100.0, 0.1).build();
+        collider_set.insert(collider);
+
+        let rigid_body = RigidBodyBuilder::dynamic()
+            .translation(vector![0.0, 10.0])
+            .build();
+        let collider = ColliderBuilder::ball(0.5).restitution(0.7).build();
+        let ball_body_handle = rigid_body_set.insert(rigid_body);
+        collider_set.insert_with_parent(collider, ball_body_handle, &mut rigid_body_set);
+
+        let gravity = vector![0.0, -9.81];
+        let integration_parameters = IntegrationParameters::default();
+        let mut physics_pipeline = PhysicsPipeline::new();
+        let mut island_manager = IslandManager::new();
+        let mut broad_phase = BroadPhaseBvh::new();
+        let mut narrow_phase = NarrowPhase::new();
+        let mut impulse_joint_set = ImpulseJointSet::new();
+        let mut multibody_joint_set = MultibodyJointSet::new();
+        let mut ccd_solver = CCDSolver::new();
+
+        // Initialize and step once.
+        let init = physics_pipeline.initialize_for_step_collisions_last(
+            &integration_parameters,
+            &mut island_manager,
+            &mut broad_phase,
+            &mut narrow_phase,
+            &mut rigid_body_set,
+            &mut collider_set,
+            &mut impulse_joint_set,
+            &mut multibody_joint_set,
+            &(),
+            &(),
+        );
+
+        let (mc, rc, mb) = physics_pipeline.step_collisions_last(
+            &gravity,
+            &integration_parameters,
+            &mut island_manager,
+            &mut broad_phase,
+            &mut narrow_phase,
+            &mut rigid_body_set,
+            &mut collider_set,
+            &mut impulse_joint_set,
+            &mut multibody_joint_set,
+            &mut ccd_solver,
+            &(),
+            &(),
+            init.0,
+            init.1,
+            init.2,
+        );
+
+        // Test disable.
+        {
+            let ball_body = &mut rigid_body_set[ball_body_handle];
+            ball_body.set_translation(vector![1.0, 1.0], true);
+            ball_body.set_rotation(nalgebra::UnitComplex::new(1.0), true);
+            ball_body.set_enabled(false);
+        }
+
+        let (mc, rc, mb) = physics_pipeline.step_collisions_last(
+            &gravity,
+            &integration_parameters,
+            &mut island_manager,
+            &mut broad_phase,
+            &mut narrow_phase,
+            &mut rigid_body_set,
+            &mut collider_set,
+            &mut impulse_joint_set,
+            &mut multibody_joint_set,
+            &mut ccd_solver,
+            &(),
+            &(),
+            mc,
+            rc,
+            mb,
+        );
+
+        // Test re-enable.
+        {
+            let ball_body = &mut rigid_body_set[ball_body_handle];
+            ball_body.set_translation(vector![0.0, 0.0], true);
+            ball_body.set_rotation(nalgebra::UnitComplex::new(0.0), true);
+            ball_body.set_enabled(true);
+        }
+
+        physics_pipeline.step_collisions_last(
+            &gravity,
+            &integration_parameters,
+            &mut island_manager,
+            &mut broad_phase,
+            &mut narrow_phase,
+            &mut rigid_body_set,
+            &mut collider_set,
+            &mut impulse_joint_set,
+            &mut multibody_joint_set,
+            &mut ccd_solver,
+            &(),
+            &(),
+            mc,
+            rc,
+            mb,
+        );
+    }
 }
