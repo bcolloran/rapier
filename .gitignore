@@ -6,6 +6,7 @@ target
 .DS_Store
 package-lock.json
 **/*.csv
+benchmark_summary.txt
 .history
 .vscode/
 *.autosave.json
