@@ -17,6 +17,7 @@ use crate::geometry::{
 use crate::math::{Real, Vector};
 use crate::pipeline::{EventHandler, PhysicsHooks};
 use crate::prelude::{Collider, ModifiedRigidBodies, RigidBody, RigidBodyHandle};
+use crate::utils::CrossProduct;
 use {crate::dynamics::RigidBodySet, crate::geometry::ColliderSet};
 
 /// The main physics simulation engine that runs your physics world forward in time.
@@ -255,6 +256,49 @@ impl PhysicsPipeline {
             rb.forces
                 .compute_effective_force_and_torque(gravity, effective_mass);
         }
+
+        // Apply user-requested adhesion forces (glue / magnets / suction cups).
+        //
+        // These are set per contact manifold from `PhysicsHooks::modify_solver_contacts` (through
+        // `ContactModificationContext::adhesion_force`). Each is turned into an ordinary external
+        // force pulling the two bodies together along the contact normal, distributed across the
+        // manifold's solver contacts, and accumulated into the per-step *effective* force/torque
+        // (NOT `user_force`, which persists across steps). Because this runs after the effective
+        // forces above are computed and before the solver, it is integrated this step, and the
+        // still push-only contacts react to it — yielding holding, a break threshold, and friction
+        // without any change to the constraint solver.
+        for manifold in &manifolds {
+            let adhesion_force = manifold.data.adhesion_force;
+            let num_contacts = manifold.data.solver_contacts.len();
+            if adhesion_force == 0.0 || num_contacts == 0 {
+                continue;
+            }
+
+            // `normal` points from collider1's exterior towards collider2, so a `+` force on body1
+            // and a `-` force on body2 (both along `normal`) pulls the two bodies together.
+            let force_per_contact = manifold.data.normal * (adhesion_force / num_contacts as Real);
+
+            for (handle, sign) in [
+                (manifold.data.rigid_body1, 1.0 as Real),
+                (manifold.data.rigid_body2, -1.0 as Real),
+            ] {
+                let Some(handle) = handle else { continue };
+                let Some(rb) = bodies.get_mut_internal(handle) else {
+                    continue;
+                };
+                if rb.body_type != RigidBodyType::Dynamic {
+                    continue;
+                }
+
+                let force = force_per_contact * sign;
+                let com = rb.mprops.world_com;
+                for contact in &manifold.data.solver_contacts {
+                    rb.forces.force += force;
+                    rb.forces.torque += (contact.point - com).gcross(force);
+                }
+            }
+        }
+
         self.counters.stages.update_time.pause();
 
         self.counters.stages.solver_time.resume();
@@ -1560,11 +1604,9 @@ mod test {
         colliders.insert_with_parent(floor_collider, floor_handle, &mut bodies);
 
         #[cfg(feature = "dim2")]
-        let ball_rb = RigidBodyBuilder::dynamic()
-            .translation(Vector::new(0.0, 5.0));
+        let ball_rb = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0));
         #[cfg(feature = "dim3")]
-        let ball_rb = RigidBodyBuilder::dynamic()
-            .translation(Vector::new(0.0, 5.0, 0.0));
+        let ball_rb = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0, 0.0));
         let ball_handle = bodies.insert(ball_rb);
         let ball_collider = ColliderBuilder::ball(0.5).restitution(0.7);
         colliders.insert_with_parent(ball_collider, ball_handle, &mut bodies);
@@ -1617,11 +1659,7 @@ mod test {
 
         let floor_a = bodies_a.insert(RigidBodyBuilder::fixed());
         #[cfg(feature = "dim2")]
-        colliders_a.insert_with_parent(
-            ColliderBuilder::cuboid(10.0, 0.1),
-            floor_a,
-            &mut bodies_a,
-        );
+        colliders_a.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1), floor_a, &mut bodies_a);
         #[cfg(feature = "dim3")]
         colliders_a.insert_with_parent(
             ColliderBuilder::cuboid(10.0, 0.1, 10.0),
@@ -1630,15 +1668,11 @@ mod test {
         );
 
         #[cfg(feature = "dim2")]
-        let ball_a = bodies_a.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0)),
-        );
+        let ball_a =
+            bodies_a.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0)));
         #[cfg(feature = "dim3")]
-        let ball_a = bodies_a.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0, 0.0)),
-        );
+        let ball_a =
+            bodies_a.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0, 0.0)));
         colliders_a.insert_with_parent(
             ColliderBuilder::ball(0.5).restitution(0.7),
             ball_a,
@@ -1675,11 +1709,7 @@ mod test {
 
         let floor_b = bodies_b.insert(RigidBodyBuilder::fixed());
         #[cfg(feature = "dim2")]
-        colliders_b.insert_with_parent(
-            ColliderBuilder::cuboid(10.0, 0.1),
-            floor_b,
-            &mut bodies_b,
-        );
+        colliders_b.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1), floor_b, &mut bodies_b);
         #[cfg(feature = "dim3")]
         colliders_b.insert_with_parent(
             ColliderBuilder::cuboid(10.0, 0.1, 10.0),
@@ -1688,15 +1718,11 @@ mod test {
         );
 
         #[cfg(feature = "dim2")]
-        let ball_b = bodies_b.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0)),
-        );
+        let ball_b =
+            bodies_b.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0)));
         #[cfg(feature = "dim3")]
-        let ball_b = bodies_b.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0, 0.0)),
-        );
+        let ball_b =
+            bodies_b.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0, 0.0)));
         colliders_b.insert_with_parent(
             ColliderBuilder::ball(0.5).restitution(0.7),
             ball_b,
@@ -1755,20 +1781,12 @@ mod test {
 
         // Create a dynamic body.
         #[cfg(feature = "dim2")]
-        let dynamic_body = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0)),
-        );
+        let dynamic_body =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0)));
         #[cfg(feature = "dim3")]
-        let dynamic_body = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0, 0.0)),
-        );
-        colliders.insert_with_parent(
-            ColliderBuilder::ball(0.5),
-            dynamic_body,
-            &mut bodies,
-        );
+        let dynamic_body =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0, 0.0)));
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), dynamic_body, &mut bodies);
 
         for _ in 0..10 {
             pipeline.step_collisions_last(
@@ -1790,15 +1808,11 @@ mod test {
         // Now add a new dynamic body and a joint BETWEEN steps.
         // This is the scenario that triggers the bug.
         #[cfg(feature = "dim2")]
-        let new_body = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(2.0, 5.0)),
-        );
+        let new_body =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(2.0, 5.0)));
         #[cfg(feature = "dim3")]
-        let new_body = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(2.0, 5.0, 0.0)),
-        );
+        let new_body =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(2.0, 5.0, 0.0)));
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), new_body, &mut bodies);
 
         // Add a joint between the fixed body and the new dynamic body.
@@ -1860,41 +1874,23 @@ mod test {
         // Create a floor.
         let floor = bodies.insert(RigidBodyBuilder::fixed());
         #[cfg(feature = "dim2")]
-        colliders.insert_with_parent(
-            ColliderBuilder::cuboid(10.0, 0.1),
-            floor,
-            &mut bodies,
-        );
+        colliders.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1), floor, &mut bodies);
         #[cfg(feature = "dim3")]
-        colliders.insert_with_parent(
-            ColliderBuilder::cuboid(10.0, 0.1, 10.0),
-            floor,
-            &mut bodies,
-        );
+        colliders.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1, 10.0), floor, &mut bodies);
 
         // Create two dynamic balls that will land on the floor and contact it.
         #[cfg(feature = "dim2")]
-        let ball1 = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 2.0)),
-        );
+        let ball1 = bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 2.0)));
         #[cfg(feature = "dim3")]
-        let ball1 = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 2.0, 0.0)),
-        );
+        let ball1 =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 2.0, 0.0)));
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), ball1, &mut bodies);
 
         #[cfg(feature = "dim2")]
-        let ball2 = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(1.5, 2.0)),
-        );
+        let ball2 = bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(1.5, 2.0)));
         #[cfg(feature = "dim3")]
-        let ball2 = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(1.5, 2.0, 0.0)),
-        );
+        let ball2 =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(1.5, 2.0, 0.0)));
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), ball2, &mut bodies);
 
         // Run some steps so bodies fall and make contact.
@@ -2131,8 +2127,7 @@ mod test {
         let params = IntegrationParameters::default();
 
         // Initialize body as kinematic with mass.
-        let rb = RigidBodyBuilder::kinematic_position_based()
-            .additional_mass(1.0);
+        let rb = RigidBodyBuilder::kinematic_position_based().additional_mass(1.0);
         let h = bodies.insert(rb);
 
         // Step once with step_collisions_last.
@@ -2259,8 +2254,7 @@ mod test {
         let collider = ColliderBuilder::cuboid(100.0, 0.1);
         collider_set.insert(collider);
 
-        let rigid_body = RigidBodyBuilder::dynamic()
-            .translation(Vector::new(0.0, 10.0));
+        let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 10.0));
         let collider = ColliderBuilder::ball(0.5).restitution(0.7);
         let ball_body_handle = rigid_body_set.insert(rigid_body);
         collider_set.insert_with_parent(collider, ball_body_handle, &mut rigid_body_set);
@@ -2413,11 +2407,9 @@ mod test {
             colliders.insert_with_parent(floor_collider, floor_handle, &mut bodies);
 
         #[cfg(feature = "dim2")]
-        let ball_rb = RigidBodyBuilder::dynamic()
-            .translation(Vector::new(0.0, 5.0));
+        let ball_rb = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0));
         #[cfg(feature = "dim3")]
-        let ball_rb = RigidBodyBuilder::dynamic()
-            .translation(Vector::new(0.0, 5.0, 0.0));
+        let ball_rb = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0, 0.0));
         let ball_handle = bodies.insert(ball_rb);
         let ball_collider = ColliderBuilder::ball(0.5).restitution(0.7);
         let ball_co_handle = colliders.insert_with_parent(ball_collider, ball_handle, &mut bodies);
@@ -2676,8 +2668,7 @@ mod test {
         let gravity = Vector::Y * -9.81;
         let params = IntegrationParameters::default();
 
-        let rb = RigidBodyBuilder::kinematic_position_based()
-            .additional_mass(1.0);
+        let rb = RigidBodyBuilder::kinematic_position_based().additional_mass(1.0);
         let h = bodies.insert(rb);
 
         // Manual init.
@@ -2841,11 +2832,7 @@ mod test {
 
         let floor_a = bodies_a.insert(RigidBodyBuilder::fixed());
         #[cfg(feature = "dim2")]
-        colliders_a.insert_with_parent(
-            ColliderBuilder::cuboid(10.0, 0.1),
-            floor_a,
-            &mut bodies_a,
-        );
+        colliders_a.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1), floor_a, &mut bodies_a);
         #[cfg(feature = "dim3")]
         colliders_a.insert_with_parent(
             ColliderBuilder::cuboid(10.0, 0.1, 10.0),
@@ -2854,15 +2841,11 @@ mod test {
         );
 
         #[cfg(feature = "dim2")]
-        let ball_a = bodies_a.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0)),
-        );
+        let ball_a =
+            bodies_a.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0)));
         #[cfg(feature = "dim3")]
-        let ball_a = bodies_a.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0, 0.0)),
-        );
+        let ball_a =
+            bodies_a.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0, 0.0)));
         colliders_a.insert_with_parent(
             ColliderBuilder::ball(0.5).restitution(0.7),
             ball_a,
@@ -2899,11 +2882,7 @@ mod test {
 
         let floor_b = bodies_b.insert(RigidBodyBuilder::fixed());
         #[cfg(feature = "dim2")]
-        colliders_b.insert_with_parent(
-            ColliderBuilder::cuboid(10.0, 0.1),
-            floor_b,
-            &mut bodies_b,
-        );
+        colliders_b.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1), floor_b, &mut bodies_b);
         #[cfg(feature = "dim3")]
         colliders_b.insert_with_parent(
             ColliderBuilder::cuboid(10.0, 0.1, 10.0),
@@ -2912,15 +2891,11 @@ mod test {
         );
 
         #[cfg(feature = "dim2")]
-        let ball_b = bodies_b.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0)),
-        );
+        let ball_b =
+            bodies_b.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0)));
         #[cfg(feature = "dim3")]
-        let ball_b = bodies_b.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0, 0.0)),
-        );
+        let ball_b =
+            bodies_b.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0, 0.0)));
         colliders_b.insert_with_parent(
             ColliderBuilder::ball(0.5).restitution(0.7),
             ball_b,
@@ -2969,7 +2944,6 @@ mod test {
 
     #[test]
     fn manual_init_joint_added_between_steps() {
-
         let mut pipeline = PhysicsPipeline::new();
         let gravity = Vector::Y * -9.81;
         let integration_parameters = IntegrationParameters::default();
@@ -2985,20 +2959,12 @@ mod test {
         let fixed_body = bodies.insert(RigidBodyBuilder::fixed());
 
         #[cfg(feature = "dim2")]
-        let dynamic_body = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0)),
-        );
+        let dynamic_body =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0)));
         #[cfg(feature = "dim3")]
-        let dynamic_body = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 5.0, 0.0)),
-        );
-        colliders.insert_with_parent(
-            ColliderBuilder::ball(0.5),
-            dynamic_body,
-            &mut bodies,
-        );
+        let dynamic_body =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 5.0, 0.0)));
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), dynamic_body, &mut bodies);
 
         // Manual init.
         pipeline.initialize_collisions_last(
@@ -3033,15 +2999,11 @@ mod test {
 
         // Add new body + joint between steps.
         #[cfg(feature = "dim2")]
-        let new_body = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(2.0, 5.0)),
-        );
+        let new_body =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(2.0, 5.0)));
         #[cfg(feature = "dim3")]
-        let new_body = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(2.0, 5.0, 0.0)),
-        );
+        let new_body =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(2.0, 5.0, 0.0)));
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), new_body, &mut bodies);
 
         #[cfg(feature = "dim2")]
@@ -3073,7 +3035,6 @@ mod test {
 
     #[test]
     fn manual_init_body_removal_between_steps() {
-
         let mut pipeline = PhysicsPipeline::new();
         let gravity = Vector::Y * -9.81;
         let integration_parameters = IntegrationParameters::default();
@@ -3088,40 +3049,22 @@ mod test {
 
         let floor = bodies.insert(RigidBodyBuilder::fixed());
         #[cfg(feature = "dim2")]
-        colliders.insert_with_parent(
-            ColliderBuilder::cuboid(10.0, 0.1),
-            floor,
-            &mut bodies,
-        );
+        colliders.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1), floor, &mut bodies);
         #[cfg(feature = "dim3")]
-        colliders.insert_with_parent(
-            ColliderBuilder::cuboid(10.0, 0.1, 10.0),
-            floor,
-            &mut bodies,
-        );
+        colliders.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1, 10.0), floor, &mut bodies);
 
         #[cfg(feature = "dim2")]
-        let ball1 = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 2.0)),
-        );
+        let ball1 = bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 2.0)));
         #[cfg(feature = "dim3")]
-        let ball1 = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(0.0, 2.0, 0.0)),
-        );
+        let ball1 =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 2.0, 0.0)));
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), ball1, &mut bodies);
 
         #[cfg(feature = "dim2")]
-        let ball2 = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(1.5, 2.0)),
-        );
+        let ball2 = bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(1.5, 2.0)));
         #[cfg(feature = "dim3")]
-        let ball2 = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(Vector::new(1.5, 2.0, 0.0)),
-        );
+        let ball2 =
+            bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(1.5, 2.0, 0.0)));
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), ball2, &mut bodies);
 
         // Manual init.
@@ -3194,8 +3137,7 @@ mod test {
         let ground_collider = ColliderBuilder::cuboid(100.0, 0.1);
         let ground_co_handle = collider_set.insert(ground_collider);
 
-        let rigid_body = RigidBodyBuilder::dynamic()
-            .translation(Vector::new(0.0, 10.0));
+        let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 10.0));
         let collider = ColliderBuilder::ball(0.5).restitution(0.7);
         let ball_body_handle = rigid_body_set.insert(rigid_body);
         let ball_co_handle =
@@ -3313,12 +3255,10 @@ mod test {
 
         // Two overlapping balls at origin.
         let rb1 = bodies.insert(RigidBodyBuilder::fixed());
-        let co1 =
-            colliders.insert_with_parent(ColliderBuilder::ball(1.0), rb1, &mut bodies);
+        let co1 = colliders.insert_with_parent(ColliderBuilder::ball(1.0), rb1, &mut bodies);
 
         let rb2 = bodies.insert(RigidBodyBuilder::dynamic());
-        let co2 =
-            colliders.insert_with_parent(ColliderBuilder::ball(1.0), rb2, &mut bodies);
+        let co2 = colliders.insert_with_parent(ColliderBuilder::ball(1.0), rb2, &mut bodies);
 
         // First init.
         pipeline.initialize_collisions_last(
@@ -3374,5 +3314,337 @@ mod test {
                 &(),
             );
         }
+    }
+}
+
+/// Hand-solved tests for the adhesion contact force (`ContactModificationContext::adhesion_force`).
+///
+/// All scenarios use a 1x1 dynamic box (default density 1.0 => mass 1.0, so weight = m*g = g) so the
+/// analytic thresholds are easy to reason about. The adhesion force is an external attractive force,
+/// so a body of weight `w` is held while `adhesion >= w + opposing_load`, and the contact reaction to
+/// the pull provides friction with limit `mu * adhesion`.
+#[cfg(all(test, feature = "dim2"))]
+mod adhesion_test {
+    use crate::prelude::*;
+    use approx::assert_abs_diff_eq;
+
+    const G: Real = 9.81;
+
+    /// Applies a fixed adhesion force to every contact manifold that involves `collider`.
+    struct AdhesionHook {
+        collider: ColliderHandle,
+        force: Real,
+    }
+
+    impl PhysicsHooks for AdhesionHook {
+        fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+            if context.collider1 == self.collider || context.collider2 == self.collider {
+                *context.adhesion_force = self.force;
+            }
+        }
+    }
+
+    /// Minimal world wrapper so each test can `step()` without repeating the long argument list.
+    struct World {
+        pipeline: PhysicsPipeline,
+        islands: IslandManager,
+        broad_phase: BroadPhaseBvh,
+        narrow_phase: NarrowPhase,
+        bodies: RigidBodySet,
+        colliders: ColliderSet,
+        impulse_joints: ImpulseJointSet,
+        multibody_joints: MultibodyJointSet,
+        ccd: CCDSolver,
+        params: IntegrationParameters,
+        gravity: Vector,
+    }
+
+    impl World {
+        fn new(gravity: Vector) -> Self {
+            Self {
+                pipeline: PhysicsPipeline::new(),
+                islands: IslandManager::new(),
+                broad_phase: BroadPhaseBvh::new(),
+                narrow_phase: NarrowPhase::new(),
+                bodies: RigidBodySet::new(),
+                colliders: ColliderSet::new(),
+                impulse_joints: ImpulseJointSet::new(),
+                multibody_joints: MultibodyJointSet::new(),
+                ccd: CCDSolver::new(),
+                params: IntegrationParameters::default(),
+                gravity,
+            }
+        }
+
+        fn step(&mut self, hooks: &dyn PhysicsHooks, n: usize) {
+            for _ in 0..n {
+                self.pipeline.step(
+                    self.gravity,
+                    &self.params,
+                    &mut self.islands,
+                    &mut self.broad_phase,
+                    &mut self.narrow_phase,
+                    &mut self.bodies,
+                    &mut self.colliders,
+                    &mut self.impulse_joints,
+                    &mut self.multibody_joints,
+                    &mut self.ccd,
+                    hooks,
+                    &(),
+                );
+            }
+        }
+    }
+
+    /// Fixed horizontal surface (thick cuboid) whose *bottom* face is at y = 0 with contact
+    /// modification enabled, plus a 1x1 dynamic box whose *top* face starts touching it from below
+    /// (i.e. hanging under the ceiling). Returns `(ceiling_collider, box_body)`.
+    fn ceiling_and_hanging_box(world: &mut World) -> (ColliderHandle, RigidBodyHandle) {
+        let ceiling_body = world.bodies.insert(RigidBodyBuilder::fixed());
+        let ceiling = world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(5.0, 0.5)
+                .translation(Vector::new(0.0, 0.5))
+                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+            ceiling_body,
+            &mut world.bodies,
+        );
+
+        let box_body = world
+            .bodies
+            .insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, -0.5)));
+        world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(0.5, 0.5),
+            box_body,
+            &mut world.bodies,
+        );
+
+        (ceiling, box_body)
+    }
+
+    /// Fixed *vertical* wall whose left face is at x = 0 (contact modification enabled), plus a 1x1
+    /// dynamic box with friction `mu` whose right face starts touching that wall from the left.
+    fn wall_and_box(world: &mut World, mu: Real) -> (ColliderHandle, RigidBodyHandle) {
+        let wall_body = world.bodies.insert(RigidBodyBuilder::fixed());
+        let wall = world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(0.5, 10.0)
+                .translation(Vector::new(0.5, 0.0))
+                .friction(mu)
+                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+            wall_body,
+            &mut world.bodies,
+        );
+
+        let box_body = world
+            .bodies
+            .insert(RigidBodyBuilder::dynamic().translation(Vector::new(-0.5, 0.0)));
+        world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(0.5, 0.5).friction(mu),
+            box_body,
+            &mut world.bodies,
+        );
+
+        (wall, box_body)
+    }
+
+    #[test]
+    fn adhesion_holds_box_below_ceiling() {
+        let mut world = World::new(Vector::new(0.0, -G));
+        let (ceiling, box_body) = ceiling_and_hanging_box(&mut world);
+
+        // Adhesion comfortably exceeds the box weight (m*g ~= 9.81): it should hang, not fall.
+        let hook = AdhesionHook {
+            collider: ceiling,
+            force: 30.0,
+        };
+        world.step(&hook, 300);
+
+        let box_rb = &world.bodies[box_body];
+        let y = box_rb.translation().y;
+        let vy = box_rb.linvel().y;
+
+        // Still hanging just under the ceiling (started at y = -0.5), not fallen.
+        assert!(y > -0.6, "box fell to y = {y} despite strong adhesion");
+        // Stability: at rest and finite, i.e. no spurious energy gain over many steps.
+        assert!(box_rb.translation().x.is_finite() && vy.is_finite());
+        assert_abs_diff_eq!(vy, 0.0, epsilon = 0.1);
+    }
+
+    #[test]
+    fn weak_adhesion_lets_box_fall() {
+        let mut world = World::new(Vector::new(0.0, -G));
+        let (ceiling, box_body) = ceiling_and_hanging_box(&mut world);
+
+        // Adhesion far below the box weight: it cannot hold, so the box falls away.
+        let hook = AdhesionHook {
+            collider: ceiling,
+            force: 3.0,
+        };
+        world.step(&hook, 120);
+
+        let y = world.bodies[box_body].translation().y;
+        assert!(y < -1.0, "box should have fallen but is at y = {y}");
+    }
+
+    #[test]
+    fn adhesion_break_threshold() {
+        // Holds when adhesion exceeds weight + opposing load...
+        {
+            let mut world = World::new(Vector::new(0.0, -G));
+            let (ceiling, box_body) = ceiling_and_hanging_box(&mut world);
+            let w = world.bodies[box_body].mass() * G;
+            // adhesion (w + 3) > weight + load (w + 1)  => holds.
+            world.bodies[box_body].add_force(Vector::new(0.0, -1.0), true);
+            let hook = AdhesionHook {
+                collider: ceiling,
+                force: w + 3.0,
+            };
+            world.step(&hook, 300);
+            let y = world.bodies[box_body].translation().y;
+            assert!(
+                y > -0.6,
+                "box should hold under sub-threshold load (y = {y})"
+            );
+        }
+        // ...and detaches once the opposing load pushes past the adhesion.
+        {
+            let mut world = World::new(Vector::new(0.0, -G));
+            let (ceiling, box_body) = ceiling_and_hanging_box(&mut world);
+            let w = world.bodies[box_body].mass() * G;
+            // adhesion (w + 3) < weight + load (w + 5)  => breaks free.
+            world.bodies[box_body].add_force(Vector::new(0.0, -5.0), true);
+            let hook = AdhesionHook {
+                collider: ceiling,
+                force: w + 3.0,
+            };
+            world.step(&hook, 200);
+            let y = world.bodies[box_body].translation().y;
+            assert!(
+                y < -1.0,
+                "box should break free under over-threshold load (y = {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn adhesion_friction_holds_box_on_vertical_wall() {
+        // High friction: mu*adhesion = 1.0 * 20 = 20 > m*g  => the box does not slide.
+        let mut world = World::new(Vector::new(0.0, -G));
+        let (wall, box_body) = wall_and_box(&mut world, 1.0);
+        let y0 = world.bodies[box_body].translation().y;
+
+        let hook = AdhesionHook {
+            collider: wall,
+            force: 20.0,
+        };
+        world.step(&hook, 300);
+
+        let box_rb = &world.bodies[box_body];
+        // Stuck to the wall (x unchanged) and not sliding down (y unchanged).
+        assert_abs_diff_eq!(box_rb.translation().x, -0.5, epsilon = 0.05);
+        assert_abs_diff_eq!(box_rb.translation().y, y0, epsilon = 0.1);
+    }
+
+    #[test]
+    fn adhesion_low_friction_slides_but_stays_attached() {
+        // Low friction: mu*adhesion = 0.1 * 20 = 2.0 < m*g  => the box slides down the wall...
+        let mut world = World::new(Vector::new(0.0, -G));
+        let (wall, box_body) = wall_and_box(&mut world, 0.1);
+        let y0 = world.bodies[box_body].translation().y;
+
+        let hook = AdhesionHook {
+            collider: wall,
+            force: 20.0,
+        };
+        // Few enough steps that the box stays within the (tall) wall's vertical extent.
+        world.step(&hook, 60);
+
+        let box_rb = &world.bodies[box_body];
+        // ...yet remains attached to the wall (x essentially unchanged).
+        assert!(
+            box_rb.translation().y < y0 - 0.5,
+            "box should have slid down (y = {})",
+            box_rb.translation().y
+        );
+        assert_abs_diff_eq!(box_rb.translation().x, -0.5, epsilon = 0.1);
+    }
+
+    #[test]
+    fn zero_adhesion_is_inert() {
+        // A box resting on the ground with a hook that requests *zero* adhesion must behave exactly
+        // like an ordinary contact: it rests on top and is not pulled into the ground.
+        let mut world = World::new(Vector::new(0.0, -G));
+        let ground_body = world.bodies.insert(RigidBodyBuilder::fixed());
+        let ground = world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(5.0, 0.5)
+                .translation(Vector::new(0.0, -0.5))
+                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+            ground_body,
+            &mut world.bodies,
+        );
+        let box_body = world
+            .bodies
+            .insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 0.5)));
+        world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(0.5, 0.5),
+            box_body,
+            &mut world.bodies,
+        );
+
+        let hook = AdhesionHook {
+            collider: ground,
+            force: 0.0,
+        };
+        world.step(&hook, 300);
+
+        let box_rb = &world.bodies[box_body];
+        // Rests on top of the ground (around y = 0.5), at rest.
+        assert_abs_diff_eq!(box_rb.translation().y, 0.5, epsilon = 0.05);
+        assert_abs_diff_eq!(box_rb.linvel().y, 0.0, epsilon = 0.05);
+    }
+
+    #[test]
+    fn adhesion_holds_box_on_beyond_vertical_overhang() {
+        // A slab tilted past vertical (135°) overhangs, so its sticky face points partly downward
+        // and gravity actively peels the box away. With strong adhesion + high friction the box must
+        // still cling on, barely moving — this is the headline "hang on past vertical" behaviour.
+        let angle = 135.0 * std::f32::consts::PI / 180.0;
+        let mut world = World::new(Vector::new(0.0, -G));
+
+        let surf_center = Vector::new(0.0, 5.0);
+        let surf_body = world.bodies.insert(RigidBodyBuilder::fixed());
+        let surf = world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(4.0, 0.25)
+                .translation(surf_center)
+                .rotation(angle)
+                .friction(1.0)
+                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+            surf_body,
+            &mut world.bodies,
+        );
+
+        // Box clinging to the slab's outward face (its local +Y rotated by `angle`).
+        let face_normal = Vector::new(-angle.sin(), angle.cos());
+        let box_center = surf_center + face_normal * (0.25 + 0.5 - 0.01);
+        let box_body = world.bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(box_center)
+                .rotation(angle),
+        );
+        world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(0.5, 0.5).friction(1.0),
+            box_body,
+            &mut world.bodies,
+        );
+
+        let p0 = world.bodies[box_body].translation();
+        let hook = AdhesionHook {
+            collider: surf,
+            force: 60.0,
+        };
+        world.step(&hook, 300);
+
+        let p = world.bodies[box_body].translation();
+        assert_abs_diff_eq!(p.x, p0.x, epsilon = 0.15);
+        assert_abs_diff_eq!(p.y, p0.y, epsilon = 0.15);
     }
 }

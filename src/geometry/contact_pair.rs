@@ -345,6 +345,20 @@ pub struct ContactManifoldData {
     pub relative_dominance: i16,
     /// A user-defined piece of data.
     pub user_data: u32,
+    /// Attractive adhesion force pulling the two bodies together (e.g. glue, magnets, suction cups).
+    ///
+    /// This is distributed across this manifold's [`Self::solver_contacts`] and applied along the
+    /// contact [`Self::normal`] during the timestep, *before* the constraint solver runs, like an
+    /// ordinary external force (e.g. gravity). The contact constraint itself stays push-only and
+    /// reacts to this pull, so a holding force, a natural break threshold, and friction all emerge
+    /// without modifying the solver.
+    ///
+    /// A value of `0.0` (the default) means an ordinary contact with no attraction. It is reset to
+    /// `0.0` at the start of each step and is typically set from
+    /// [`crate::pipeline::PhysicsHooks::modify_solver_contacts`] through
+    /// [`crate::pipeline::ContactModificationContext::adhesion_force`].
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub adhesion_force: Real,
 }
 
 /// A single solver contact.
@@ -604,6 +618,7 @@ impl ContactManifoldData {
             solver_contacts: Vec::new(),
             relative_dominance: 0,
             user_data: 0,
+            adhesion_force: 0.0,
         }
     }
 

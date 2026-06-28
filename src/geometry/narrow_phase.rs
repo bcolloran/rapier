@@ -1079,6 +1079,9 @@ impl NarrowPhase {
                             std::mem::take(&mut manifold.data.solver_contacts);
                         let mut modifiable_user_data = manifold.data.user_data;
                         let mut modifiable_normal = manifold.data.normal;
+                        // Adhesion is not persistent (unlike `user_data`): it must be re-requested
+                        // by the hook on every step, so we start from zero each time.
+                        let mut modifiable_adhesion_force = 0.0;
 
                         let mut context = ContactModificationContext {
                             bodies,
@@ -1091,6 +1094,7 @@ impl NarrowPhase {
                             solver_contacts: &mut modifiable_solver_contacts,
                             normal: &mut modifiable_normal,
                             user_data: &mut modifiable_user_data,
+                            adhesion_force: &mut modifiable_adhesion_force,
                         };
 
                         hooks.modify_solver_contacts(&mut context);
@@ -1098,6 +1102,7 @@ impl NarrowPhase {
                         manifold.data.solver_contacts = modifiable_solver_contacts;
                         manifold.data.normal = modifiable_normal;
                         manifold.data.user_data = modifiable_user_data;
+                        manifold.data.adhesion_force = modifiable_adhesion_force;
                     }
                 }
             }

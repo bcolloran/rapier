@@ -39,6 +39,7 @@ mod s2d_high_mass_ratio_2;
 mod s2d_high_mass_ratio_3;
 mod s2d_joint_grid;
 mod s2d_pyramid;
+mod adhesion2;
 mod sensor2;
 mod stress_tests;
 #[cfg(not(target_arch = "wasm32"))]
@@ -86,6 +87,7 @@ pub async fn main() {
         Example::new(DYNAMICS, "Restitution", restitution2::init_world),
         Example::new(DYNAMICS, "Damping", damping2::init_world),
         Example::new(DYNAMICS, "CCD", ccd2::init_world),
+        Example::new(DYNAMICS, "Adhesion", adhesion2::init_world),
         // ── Joints ─────────────────────────────────────────────────────────
         Example::new(JOINTS, "Joints", joints2::init_world),
         Example::new(JOINTS, "Rope Joints", rope_joints2::init_world),
