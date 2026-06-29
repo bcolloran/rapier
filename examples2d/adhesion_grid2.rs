@@ -1,18 +1,38 @@
 use rapier_testbed2d::Testbed;
 use rapier2d::prelude::*;
 
-/// Looks up a per-wall adhesion force, so every wall in the grid can use a different strength.
+/// Per-wall adhesion that is also selected *by which face the contact is on*: the left face uses
+/// `left`, the right face uses `right`, and the wall's top/bottom get no adhesion at all. This shows
+/// that adhesion is decided per contact manifold (per collider pair / face), not globally.
 struct AdhesionGridHook {
-    walls: Vec<(ColliderHandle, Real)>,
+    // (wall collider, wall angle, left-face adhesion, right-face adhesion)
+    walls: Vec<(ColliderHandle, Real, Real, Real)>,
 }
 
 impl PhysicsHooks for AdhesionGridHook {
     fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
-        for &(wall, force) in &self.walls {
-            if context.collider1 == wall || context.collider2 == wall {
-                *context.adhesion_force = force;
-                return;
+        for &(wall, angle, left, right) in &self.walls {
+            // The contact normal pointing *out of the wall* (the manifold normal points out of
+            // collider1, so flip it when the wall is collider2).
+            let outward = if context.collider1 == wall {
+                *context.normal
+            } else if context.collider2 == wall {
+                -*context.normal
+            } else {
+                continue;
+            };
+
+            // Decompose that normal in the (rotated) wall's local frame.
+            let right_axis = Vector::new(angle.cos(), angle.sin());
+            let up_axis = Vector::new(-angle.sin(), angle.cos());
+            let along_face = outward.dot(right_axis); // + = right face, - = left face
+            let along_length = outward.dot(up_axis); // dominant = top/bottom face
+
+            // Only adhere on the side faces; leave top/bottom contacts at zero adhesion.
+            if along_face.abs() > along_length.abs() {
+                *context.adhesion_force = if along_face > 0.0 { right } else { left };
             }
+            return;
         }
     }
 }
@@ -22,35 +42,20 @@ const WALL_HALF_LENGTH: Real = 1.3;
 const BOX_HALF: Real = 0.4;
 const FRICTION: Real = 0.5;
 
-/// Adds one grid cell: a fixed wall tilted by `angle` (radians) with adhesion enabled, and a box
-/// adhered to the *left face, near the top* of that wall.
-fn add_cell(
+/// Adds a dynamic box clinging to one face of a wall. `side` is +1 for the right face, -1 for the
+/// left face.
+fn add_side_box(
     bodies: &mut RigidBodySet,
     colliders: &mut ColliderSet,
-    walls: &mut Vec<(ColliderHandle, Real)>,
-    center: Vector,
+    wall_center: Vector,
     angle: Real,
-    adhesion: Real,
+    side: Real,
 ) {
-    let wall_body = bodies.insert(RigidBodyBuilder::fixed());
-    let wall = colliders.insert_with_parent(
-        ColliderBuilder::cuboid(WALL_HALF_THICKNESS, WALL_HALF_LENGTH)
-            .translation(center)
-            .rotation(angle)
-            .friction(FRICTION)
-            .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
-        wall_body,
-        bodies,
-    );
-    walls.push((wall, adhesion));
-
-    // The wall's local -X (left face normal) and local +Y (along its length), both rotated.
-    let left_normal = Vector::new(-angle.cos(), -angle.sin());
+    let face_normal = Vector::new(side * angle.cos(), side * angle.sin());
     let up = Vector::new(-angle.sin(), angle.cos());
-    // Box on the left face, near the top, just touching (a hair of overlap => an active contact).
-    let box_center = center
+    let box_center = wall_center
         + up * (WALL_HALF_LENGTH * 0.55)
-        + left_normal * (WALL_HALF_THICKNESS + BOX_HALF - 0.01);
+        + face_normal * (WALL_HALF_THICKNESS + BOX_HALF - 0.01);
     let box_body = bodies.insert(
         RigidBodyBuilder::dynamic()
             .translation(box_center)
@@ -61,6 +66,34 @@ fn add_cell(
         box_body,
         bodies,
     );
+}
+
+/// Adds one grid cell: a fixed wall tilted by `angle` with a box adhered to *each* side. The left
+/// face uses `left_adhesion`, the right face uses twice that.
+fn add_cell(
+    bodies: &mut RigidBodySet,
+    colliders: &mut ColliderSet,
+    walls: &mut Vec<(ColliderHandle, Real, Real, Real)>,
+    center: Vector,
+    angle: Real,
+    left_adhesion: Real,
+) {
+    let right_adhesion = 2.0 * left_adhesion;
+
+    let wall_body = bodies.insert(RigidBodyBuilder::fixed());
+    let wall = colliders.insert_with_parent(
+        ColliderBuilder::cuboid(WALL_HALF_THICKNESS, WALL_HALF_LENGTH)
+            .translation(center)
+            .rotation(angle)
+            .friction(FRICTION)
+            .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+        wall_body,
+        bodies,
+    );
+    walls.push((wall, angle, left_adhesion, right_adhesion));
+
+    add_side_box(bodies, colliders, center, angle, -1.0); // left face
+    add_side_box(bodies, colliders, center, angle, 1.0); // right face
 }
 
 pub fn init_world(testbed: &mut Testbed) {
@@ -77,12 +110,11 @@ pub fn init_world(testbed: &mut Testbed) {
     let column_x = [-10.0, -5.0, 0.0, 5.0, 10.0];
     let column_angle = [deg(45.0), deg(10.0), deg(0.0), deg(-10.0), deg(-45.0)];
 
-    // Rows vary the adhesion strength down the y-axis. The top row is strong enough that nothing
-    // moves (stuck fast, no sliding even with this friction); the bottom row has zero adhesion so
-    // its boxes fall / slide away immediately. The middle rows are a hand-tuned gradient which,
-    // together with the per-column tilt, produces a range of sticking and sliding behaviours.
+    // Rows vary the LEFT-face adhesion down the y-axis (the right face always gets twice as much, so
+    // on every wall the right box clings harder than the left). Top row holds; bottom row (zero) lets
+    // the left box go immediately; the middle is a hand-tuned gradient.
     let row_y = [9.0, 4.5, 0.0, -4.5, -9.0];
-    let row_adhesion = [150.0, 30.0, 11.0, 6.0, 0.0];
+    let row_adhesion = [26.0, 13.0, 11.0, 6.0, 0.0];
 
     for (&x, &angle) in column_x.iter().zip(column_angle.iter()) {
         for (&y, &adhesion) in row_y.iter().zip(row_adhesion.iter()) {
