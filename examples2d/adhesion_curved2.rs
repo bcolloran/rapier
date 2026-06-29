@@ -1,3 +1,4 @@
+use kiss3d::color::Color;
 use rapier_testbed2d::Testbed;
 use rapier2d::prelude::*;
 
@@ -71,16 +72,14 @@ pub fn init_world(testbed: &mut Testbed) {
             let half_height = 0.4;
             let r = 0.22;
             let pos = disk_center + dir * (DISK_RADIUS + r - 0.02);
-            let body = bodies.insert(
-                RigidBodyBuilder::dynamic()
-                    .translation(pos)
-                    .rotation(phi),
-            );
+            let body = bodies.insert(RigidBodyBuilder::dynamic().translation(pos).rotation(phi));
             let collider = colliders.insert_with_parent(
                 ColliderBuilder::capsule_y(half_height, r).friction(FRICTION),
                 body,
                 &mut bodies,
             );
+            // Tint the capsules so they stand out from the balls in the visualization.
+            testbed.set_initial_collider_color(collider, Color::new(1.0, 0.6, 0.1, 1.0));
             objects.push((collider, adhesion));
         }
     }
@@ -103,5 +102,5 @@ pub fn init_world(testbed: &mut Testbed) {
         Vector::new(0.0, -9.81),
         physics_hooks,
     );
-    testbed.look_at(disk_center, 10.0);
+    testbed.look_at(disk_center, 30.0);
 }

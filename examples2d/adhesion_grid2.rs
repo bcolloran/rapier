@@ -147,5 +147,5 @@ pub fn init_world(testbed: &mut Testbed) {
         Vector::new(0.0, -9.81),
         physics_hooks,
     );
-    testbed.look_at(Vec2::new(0.0, 0.0), 14.0);
+    testbed.look_at(Vec2::new(0.0, 0.0), 20.0);
 }
