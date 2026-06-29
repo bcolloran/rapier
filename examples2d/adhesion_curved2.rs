@@ -2,10 +2,8 @@ use kiss3d::color::Color;
 use rapier_testbed2d::Testbed;
 use rapier2d::prelude::*;
 
-/// Per-object adhesion: each dynamic object (ball or capsule) is registered with its own adhesion
-/// force, looked up by collider when it touches the central disk. This proves adhesion is decided
-/// per contact manifold even for round shapes with no flat faces (the manifold still has a contact
-/// point and normal).
+/// Per-object adhesion: each dynamic object (ball or capsule) gets its own adhesion force, looked
+/// up by collider when it touches the central disk (adhesion works on round shapes too).
 struct AdhesionCurvedHook {
     objects: Vec<(ColliderHandle, Real)>,
 }
@@ -53,7 +51,7 @@ pub fn init_world(testbed: &mut Testbed) {
         let phi = i as Real / count as Real * std::f32::consts::TAU;
         let dir = Vector::new(phi.cos(), phi.sin());
 
-        // Strong for two out of every four, so both shapes appear in the clinging and falling groups.
+        // Strong for two out of every four, so both shapes appear in clinging and falling groups.
         let adhesion = if i % 4 < 2 { STRONG_ADHESION } else { 0.0 };
 
         if i % 2 == 0 {
@@ -68,7 +66,7 @@ pub fn init_world(testbed: &mut Testbed) {
             );
             objects.push((collider, adhesion));
         } else {
-            // Capsule lying tangent to the disk (long axis along the local +Y, rotated to the tangent).
+            // Capsule lying tangent to the disk (long axis = local +Y, rotated to the tangent).
             let half_height = 0.4;
             let r = 0.22;
             let pos = disk_center + dir * (DISK_RADIUS + r - 0.02);

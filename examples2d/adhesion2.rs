@@ -1,12 +1,8 @@
 use rapier_testbed2d::Testbed;
 use rapier2d::prelude::*;
 
-/// Requests a fixed adhesion force on every contact manifold that involves one of the registered
+/// Sets a fixed adhesion force on every contact manifold that involves one of the registered
 /// "sticky" surface colliders.
-///
-/// This is the whole integration: the engine turns `adhesion_force` into an attractive force pulling
-/// the two bodies together at the contact, in-step, and the still push-only contact reacts to it —
-/// so the boxes hang on (even from overhangs past vertical) and friction holds / lets them slide.
 struct AdhesionHook {
     sticky: Vec<ColliderHandle>,
     force: Real,
@@ -46,7 +42,8 @@ fn add_sticky_surface(
     );
     sticky.push(surface);
 
-    // The slab's outward face normal (its local +Y rotated by `angle`); the box clings on this side.
+    // The slab's outward face normal (its local +Y rotated by `angle`); the box clings on this
+    // side.
     let face_normal = Vector::new(-angle.sin(), angle.cos());
     // Place the box just touching that face (a hair of overlap guarantees an active contact).
     let box_center = center + face_normal * (0.25 + 0.5 - 0.01);

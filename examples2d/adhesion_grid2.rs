@@ -1,9 +1,8 @@
 use rapier_testbed2d::Testbed;
 use rapier2d::prelude::*;
 
-/// Per-wall adhesion that is also selected *by which face the contact is on*: the left face uses
-/// `left`, the right face uses `right`, and the wall's top/bottom get no adhesion at all. This shows
-/// that adhesion is decided per contact manifold (per collider pair / face), not globally.
+/// Per-wall adhesion selected by which face the contact is on: the left face uses `left`, the right
+/// face uses `right`, and the wall's top/bottom get none.
 struct AdhesionGridHook {
     // (wall collider, wall angle, left-face adhesion, right-face adhesion)
     walls: Vec<(ColliderHandle, Real, Real, Real)>,
@@ -110,9 +109,9 @@ pub fn init_world(testbed: &mut Testbed) {
     let column_x = [-10.0, -5.0, 0.0, 5.0, 10.0];
     let column_angle = [deg(45.0), deg(10.0), deg(0.0), deg(-10.0), deg(-45.0)];
 
-    // Rows vary the LEFT-face adhesion down the y-axis (the right face always gets twice as much, so
-    // on every wall the right box clings harder than the left). Top row holds; bottom row (zero) lets
-    // the left box go immediately; the middle is a hand-tuned gradient.
+    // Rows vary the LEFT-face adhesion down the y-axis (the right face always gets twice as much,
+    // so the right box clings harder than the left). Top row holds; bottom row (zero) lets the left
+    // box go immediately; the middle is a hand-tuned gradient.
     let row_y = [9.0, 4.5, 0.0, -4.5, -9.0];
     let row_adhesion = [26.0, 13.0, 11.0, 6.0, 0.0];
 
