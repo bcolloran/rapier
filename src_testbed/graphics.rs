@@ -606,8 +606,8 @@ impl GraphicsManager {
         };
 
         if let Some(ref mut n) = node {
-            // `set_color_recursive` (not `set_color`) so group-wrapped shapes such as capsules,
-            // whose mesh lives in a child node, actually get colored instead of staying white.
+            // Recursive so group-wrapped shapes (e.g. capsules) are colored, not just the empty
+            // group.
             n.set_color_recursive(color);
             if sensor {
                 n.set_surface_rendering_activation(false);
@@ -729,8 +729,8 @@ impl GraphicsManager {
         };
 
         if let Some(ref mut n) = node {
-            // `set_color_recursive` (not `set_color`) so group-wrapped shapes such as capsules,
-            // whose mesh lives in a child node, actually get colored instead of staying white.
+            // Recursive so group-wrapped shapes (e.g. capsules) are colored, not just the empty
+            // group.
             n.set_color_recursive(color);
         }
 
