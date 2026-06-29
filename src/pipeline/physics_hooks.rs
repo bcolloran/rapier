@@ -43,16 +43,11 @@ pub struct ContactModificationContext<'a> {
     // NOTE: we keep this a &'a mut u32 to emphasize the
     // fact that this can be modified.
     pub user_data: &'a mut u32,
-    /// Attractive adhesion force pulling the two bodies together (e.g. glue, magnets, suction cups).
+    /// Requests an attractive adhesion force pulling the two bodies together (e.g. glue, suction).
     ///
-    /// Set this to a positive value to make the two colliders involved in this manifold stick to
-    /// each other: the engine applies it as an ordinary external force along the contact normal
-    /// (distributed across the solver contacts) *before* the constraint solver runs, so the
-    /// still-push-only contact reacts to it. This yields a holding force, a natural break threshold
-    /// (the bodies detach once an opposing load exceeds the adhesion), and friction proportional to
-    /// the adhesion — all without changing the solver.
-    ///
-    /// It is reset to `0.0` before each call, so it only has an effect on steps where it is set.
+    /// Applied as an external force along the contact normal before the solver runs, so the
+    /// push-only contact still provides the reaction (and hence friction). Reset to `0.0` before
+    /// each call; non-positive values are ignored.
     pub adhesion_force: &'a mut Real,
 }
 

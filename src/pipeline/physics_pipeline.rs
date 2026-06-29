@@ -257,25 +257,19 @@ impl PhysicsPipeline {
                 .compute_effective_force_and_torque(gravity, effective_mass);
         }
 
-        // Apply user-requested adhesion forces (glue / magnets / suction cups).
-        //
-        // These are set per contact manifold from `PhysicsHooks::modify_solver_contacts` (through
-        // `ContactModificationContext::adhesion_force`). Each is turned into an ordinary external
-        // force pulling the two bodies together along the contact normal, distributed across the
-        // manifold's solver contacts, and accumulated into the per-step *effective* force/torque
-        // (NOT `user_force`, which persists across steps). Because this runs after the effective
-        // forces above are computed and before the solver, it is integrated this step, and the
-        // still push-only contacts react to it — yielding holding, a break threshold, and friction
-        // without any change to the constraint solver.
+        // Apply user-requested adhesion: pull the two bodies of each manifold together along the
+        // contact normal (spread over its solver contacts), as an external force added to the
+        // per-step effective force/torque. Runs after gravity and before the solver, so the
+        // push-only contacts react to it this step.
         for manifold in &manifolds {
-            let adhesion_force = manifold.data.adhesion_force;
+            let adhesion_force = manifold.data.adhesion_force.max(0.0);
             let num_contacts = manifold.data.solver_contacts.len();
             if adhesion_force == 0.0 || num_contacts == 0 {
                 continue;
             }
 
-            // `normal` points from collider1's exterior towards collider2, so a `+` force on body1
-            // and a `-` force on body2 (both along `normal`) pulls the two bodies together.
+            // `normal` points out of collider1 toward collider2: +normal on body1, -normal on
+            // body2 pulls them together.
             let force_per_contact = manifold.data.normal * (adhesion_force / num_contacts as Real);
 
             for (handle, sign) in [
@@ -3319,10 +3313,9 @@ mod test {
 
 /// Hand-solved tests for the adhesion contact force (`ContactModificationContext::adhesion_force`).
 ///
-/// All scenarios use a 1x1 dynamic box (default density 1.0 => mass 1.0, so weight = m*g = g) so the
-/// analytic thresholds are easy to reason about. The adhesion force is an external attractive force,
-/// so a body of weight `w` is held while `adhesion >= w + opposing_load`, and the contact reaction to
-/// the pull provides friction with limit `mu * adhesion`.
+/// Scenarios use a 1x1 box (mass 1.0, weight `g`): adhesion holds while
+/// `adhesion >= weight + load`, and the contact reaction to the pull gives friction up to
+/// `mu * adhesion`.
 #[cfg(all(test, feature = "dim2"))]
 mod adhesion_test {
     use crate::prelude::*;
@@ -3605,8 +3598,8 @@ mod adhesion_test {
     #[test]
     fn adhesion_holds_box_on_beyond_vertical_overhang() {
         // A slab tilted past vertical (135°) overhangs, so its sticky face points partly downward
-        // and gravity actively peels the box away. With strong adhesion + high friction the box must
-        // still cling on, barely moving — this is the headline "hang on past vertical" behaviour.
+        // and gravity peels the box away. With strong adhesion and high friction it must still
+        // cling on, barely moving — the headline "hang on past vertical" behaviour.
         let angle = 135.0 * std::f32::consts::PI / 180.0;
         let mut world = World::new(Vector::new(0.0, -G));
 
@@ -3646,5 +3639,28 @@ mod adhesion_test {
         let p = world.bodies[box_body].translation();
         assert_abs_diff_eq!(p.x, p0.x, epsilon = 0.15);
         assert_abs_diff_eq!(p.y, p0.y, epsilon = 0.15);
+    }
+
+    #[test]
+    fn negative_adhesion_is_ignored() {
+        // A negative request must be clamped to zero (adhesion only pulls, never pushes), so the
+        // box falls *exactly* as it would with zero adhesion — not pushed away from the ceiling.
+        let drop = |force: Real| -> Real {
+            let mut world = World::new(Vector::new(0.0, -G));
+            let (ceiling, box_body) = ceiling_and_hanging_box(&mut world);
+            let hook = AdhesionHook {
+                collider: ceiling,
+                force,
+            };
+            let y0 = world.bodies[box_body].translation().y;
+            world.step(&hook, 60);
+            y0 - world.bodies[box_body].translation().y // distance fallen
+        };
+
+        let zero = drop(0.0);
+        let negative = drop(-30.0);
+        assert!(zero > 0.5, "box should fall under gravity with no adhesion");
+        // Negative adhesion behaves identically to zero (it is not a push-apart force).
+        assert_abs_diff_eq!(negative, zero, epsilon = 1.0e-3);
     }
 }
