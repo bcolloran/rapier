@@ -9,6 +9,7 @@ pub use self::contact_pair::{
     ContactData, ContactManifoldData, ContactPair, IntersectionPair, SimdSolverContact,
     SolverContact, SolverFlags,
 };
+pub(crate) use self::contact_pair::solver_contacts_tangential_extent;
 pub use self::interaction_graph::{
     ColliderGraphIndex, InteractionGraph, RigidBodyGraphIndex, TemporaryInteractionIndex,
 };

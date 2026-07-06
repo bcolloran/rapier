@@ -261,10 +261,22 @@ impl PhysicsPipeline {
         // contact normal (spread over its solver contacts), as an external force added to the
         // per-step effective force/torque. Runs after gravity and before the solver, so the
         // push-only contacts react to it this step.
+        //
+        // Two request flavors add up: `adhesion_force` (absolute, per manifold) and
+        // `adhesion_pressure` (per unit of contact extent — composition-invariant, since the
+        // contact spans of abutting colliders partition the body's total contact patch).
         for manifold in &manifolds {
-            let adhesion_force = manifold.data.adhesion_force.max(0.0);
             let num_contacts = manifold.data.solver_contacts.len();
-            if adhesion_force == 0.0 || num_contacts == 0 {
+            if num_contacts == 0 {
+                continue;
+            }
+
+            let mut adhesion_force = manifold.data.adhesion_force.max(0.0);
+            let adhesion_pressure = manifold.data.adhesion_pressure.max(0.0);
+            if adhesion_pressure > 0.0 {
+                adhesion_force += adhesion_pressure * manifold.data.tangential_extent();
+            }
+            if adhesion_force == 0.0 {
                 continue;
             }
 
@@ -3661,6 +3673,235 @@ mod adhesion_test {
         let negative = drop(-30.0);
         assert!(zero > 0.5, "box should fall under gravity with no adhesion");
         // Negative adhesion behaves identically to zero (it is not a push-apart force).
+        assert_abs_diff_eq!(negative, zero, epsilon = 1.0e-3);
+    }
+
+    /*
+     * Adhesion pressure (`ContactModificationContext::adhesion_pressure`): intensive adhesion,
+     * force per unit of contact extent. The headline property is composition invariance — the
+     * same behaviour whether a surface is one big collider or many small abutting ones.
+     */
+
+    /// Applies a fixed adhesion pressure to every contact manifold that involves `collider`.
+    struct PressureHook {
+        collider: ColliderHandle,
+        pressure: Real,
+    }
+
+    impl PhysicsHooks for PressureHook {
+        fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+            if context.collider1 == self.collider || context.collider2 == self.collider {
+                *context.adhesion_pressure = self.pressure;
+            }
+        }
+    }
+
+    /// A capsule (2-unit flat side) lying on the top 2 m of a 10-unit slope at 40°, built either
+    /// as a single rectangle or as 10 abutting unit squares under one fixed body. Returns the
+    /// capsule collider (hook-enabled) and body.
+    fn slope_and_capsule(world: &mut World, segmented: bool) -> (ColliderHandle, RigidBodyHandle) {
+        let theta = (40.0 as Real).to_radians();
+        let up_slope = Vector::new(theta.cos(), theta.sin());
+        let top_normal = Vector::new(-theta.sin(), theta.cos());
+
+        let statics = world.bodies.insert(RigidBodyBuilder::fixed());
+        if segmented {
+            for k in 0..10 {
+                let s = -4.5 + k as Real;
+                world.colliders.insert_with_parent(
+                    ColliderBuilder::cuboid(0.5, 0.5)
+                        .translation(up_slope * s)
+                        .rotation(theta)
+                        .friction(0.5),
+                    statics,
+                    &mut world.bodies,
+                );
+            }
+        } else {
+            world.colliders.insert_with_parent(
+                ColliderBuilder::cuboid(5.0, 0.5).rotation(theta).friction(0.5),
+                statics,
+                &mut world.bodies,
+            );
+        }
+
+        // Flat side covers the top 2 m of the slope (s in [3, 5]).
+        let cap_center = up_slope * 4.0 + top_normal * 1.0;
+        let cap_body = world.bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(cap_center)
+                .rotation(theta),
+        );
+        let capsule = world.colliders.insert_with_parent(
+            ColliderBuilder::capsule_x(1.0, 0.5)
+                .friction(0.5)
+                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+            cap_body,
+            &mut world.bodies,
+        );
+        (capsule, cap_body)
+    }
+
+    #[test]
+    fn pressure_adhesion_is_composition_invariant_on_slope() {
+        // Per-manifold `adhesion_force` on a segmented slope multiplies with the manifold count
+        // (the capsule straddles ~3 squares), so at 12 N the rectangle capsule creeps while the
+        // square-strip capsule locks solid. `adhesion_pressure` must not: with P = 12 N / 2 m,
+        // both compositions get 12 N total and must creep the same distance.
+        let pressure = 6.0; // N per meter over the 2-unit flat side => 12 N total
+        let run = |segmented: bool| -> Real {
+            let mut world = World::new(Vector::new(0.0, -G));
+            let (capsule, cap_body) = slope_and_capsule(&mut world, segmented);
+            let hook = PressureHook {
+                collider: capsule,
+                pressure,
+            };
+            let start = world.bodies[cap_body].translation();
+            world.step(&hook, 180);
+            let end = world.bodies[cap_body].translation();
+            let theta = (40.0 as Real).to_radians();
+            -(end - start).dot(Vector::new(theta.cos(), theta.sin()))
+        };
+
+        let d_rect = run(false);
+        let d_strip = run(true);
+
+        // Both creep (neither locks — a lock here is the force-mode double-counting bug)...
+        assert!(d_rect > 0.5, "rectangle capsule should creep (slid {d_rect})");
+        assert!(d_strip > 0.5, "strip capsule should creep (slid {d_strip})");
+        // ...and they creep the same distance.
+        assert_abs_diff_eq!(d_rect, d_strip, epsilon = 0.15);
+    }
+
+    #[test]
+    fn pressure_matches_equivalent_force_on_monolithic_surface() {
+        // On a single-manifold surface the two flavors describe the same physics:
+        // P * extent == F. The capsule's flat side is 2 units, so P = F / 2.
+        let force = 12.0;
+        let run = |use_pressure: bool| -> Real {
+            let mut world = World::new(Vector::new(0.0, -G));
+            let (capsule, cap_body) = slope_and_capsule(&mut world, false);
+            let start = world.bodies[cap_body].translation();
+            if use_pressure {
+                let hook = PressureHook {
+                    collider: capsule,
+                    pressure: force / 2.0,
+                };
+                world.step(&hook, 180);
+            } else {
+                let hook = AdhesionHook {
+                    collider: capsule,
+                    force,
+                };
+                world.step(&hook, 180);
+            }
+            let end = world.bodies[cap_body].translation();
+            let theta = (40.0 as Real).to_radians();
+            -(end - start).dot(Vector::new(theta.cos(), theta.sin()))
+        };
+
+        let d_pressure = run(true);
+        let d_force = run(false);
+        assert_abs_diff_eq!(d_pressure, d_force, epsilon = 0.3);
+    }
+
+    #[test]
+    fn pressure_holds_box_below_ceiling() {
+        // The hanging box's top face is 1 unit wide (extent 1), so pressure == resulting force.
+        let mut world = World::new(Vector::new(0.0, -G));
+        let (ceiling, box_body) = ceiling_and_hanging_box(&mut world);
+
+        let hook = PressureHook {
+            collider: ceiling,
+            pressure: 30.0, // x extent 1 => 30 N, comfortably above the ~9.81 N weight
+        };
+        world.step(&hook, 300);
+
+        let y = world.bodies[box_body].translation().y;
+        assert!(y > -0.6, "box fell to y = {y} despite strong adhesion pressure");
+    }
+
+    #[test]
+    fn pressure_on_point_contact_is_inert() {
+        // A ball touching the ceiling makes a single-point manifold: zero tangential extent, so
+        // even an enormous pressure produces zero force and the ball falls freely.
+        let mut world = World::new(Vector::new(0.0, -G));
+        let ceiling_body = world.bodies.insert(RigidBodyBuilder::fixed());
+        let ceiling = world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(5.0, 0.5)
+                .translation(Vector::new(0.0, 0.5))
+                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+            ceiling_body,
+            &mut world.bodies,
+        );
+        let ball_body = world
+            .bodies
+            .insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, -0.5)));
+        world.colliders.insert_with_parent(
+            ColliderBuilder::ball(0.5),
+            ball_body,
+            &mut world.bodies,
+        );
+
+        let hook = PressureHook {
+            collider: ceiling,
+            pressure: 1000.0,
+        };
+        world.step(&hook, 120);
+
+        let y = world.bodies[ball_body].translation().y;
+        assert!(y < -1.0, "point-contact ball should fall (y = {y})");
+    }
+
+    #[test]
+    fn adhesion_stops_when_hook_flag_is_removed() {
+        // Regression test: `manifold.data.adhesion_force`/`adhesion_pressure` used to be written
+        // only inside the MODIFY_SOLVER_CONTACTS branch of the narrow phase, so removing the hook
+        // flag from a collider mid-contact left the last requested value on the live manifold as a
+        // permanent phantom force. The box must fall as soon as the flag is gone.
+        let mut world = World::new(Vector::new(0.0, -G));
+        let (ceiling, box_body) = ceiling_and_hanging_box(&mut world);
+
+        let hook = AdhesionHook {
+            collider: ceiling,
+            force: 30.0,
+        };
+        world.step(&hook, 120);
+        let y_held = world.bodies[box_body].translation().y;
+        assert!(y_held > -0.6, "box should hang while the hook is active");
+
+        // Withdraw contact modification entirely; the still-alive manifold must not keep the
+        // last-requested adhesion. (Wake the box: a sleeping pair is frozen wholesale, which
+        // isn't the scenario under test.)
+        world.colliders[ceiling].set_active_hooks(ActiveHooks::empty());
+        world.bodies[box_body].wake_up(true);
+        world.step(&hook, 120);
+
+        let y = world.bodies[box_body].translation().y;
+        assert!(
+            y < -1.0,
+            "box should fall once the hook flag is removed, but is at y = {y}"
+        );
+    }
+
+    #[test]
+    fn negative_pressure_is_ignored() {
+        // Like negative force: clamped to zero, not a push-apart force.
+        let drop = |pressure: Real| -> Real {
+            let mut world = World::new(Vector::new(0.0, -G));
+            let (ceiling, box_body) = ceiling_and_hanging_box(&mut world);
+            let hook = PressureHook {
+                collider: ceiling,
+                pressure,
+            };
+            let y0 = world.bodies[box_body].translation().y;
+            world.step(&hook, 60);
+            y0 - world.bodies[box_body].translation().y
+        };
+
+        let zero = drop(0.0);
+        let negative = drop(-30.0);
+        assert!(zero > 0.5, "box should fall under gravity with no adhesion");
         assert_abs_diff_eq!(negative, zero, epsilon = 1.0e-3);
     }
 }

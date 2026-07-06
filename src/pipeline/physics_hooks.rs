@@ -48,10 +48,44 @@ pub struct ContactModificationContext<'a> {
     /// Applied as an external force along the contact normal before the solver runs, so the
     /// push-only contact still provides the reaction (and hence friction). Reset to `0.0` before
     /// each call; non-positive values are ignored.
+    ///
+    /// This is an absolute force *per manifold*: a body resting on a surface split into N
+    /// colliders spans ~N manifolds and receives ~N× the total pull. Use
+    /// [`Self::adhesion_pressure`] when the adhesion should be independent of how the surface is
+    /// decomposed into colliders.
     pub adhesion_force: &'a mut Real,
+    /// Requests an attractive adhesion *pressure*: force per unit of contact-patch extent
+    /// (per meter of contact length in 2D, per square meter of contact area in 3D).
+    ///
+    /// The engine converts it to a force by multiplying with the manifold's tangential extent
+    /// (see [`Self::tangential_extent`]) measured *after* this hook returns, and applies it
+    /// exactly like [`Self::adhesion_force`] (the two add up). Because abutting colliders' contact
+    /// spans partition the body's total contact patch, the total force and torque are the same
+    /// whether the surface is one big collider or many small ones — unlike `adhesion_force`,
+    /// which multiplies with the manifold count.
+    ///
+    /// Point contacts (2D) and point/line contacts (3D) have zero extent and receive no pressure
+    /// adhesion; use `adhesion_force` for those. Reset to `0.0` before each call; non-positive
+    /// values are ignored.
+    pub adhesion_pressure: &'a mut Real,
 }
 
 impl ContactModificationContext<'_> {
+    /// The tangential extent of the contact patch described by the *current* content of
+    /// `self.solver_contacts` and `self.normal`: the spread of the contact points perpendicular
+    /// to the normal (a length in 2D, an area in 3D).
+    ///
+    /// This is the value the engine multiplies [`Self::adhesion_pressure`] by — except the engine
+    /// measures it after the hook returns, so contacts added/removed/moved by the hook are taken
+    /// into account. Returns `0.0` for point contacts (and line contacts in 3D).
+    ///
+    /// Note: during contact modification, `self.manifold.data.solver_contacts` is empty (its
+    /// content has been moved into `self.solver_contacts`), so this helper must be used instead of
+    /// [`crate::geometry::ContactManifoldData::tangential_extent`].
+    pub fn tangential_extent(&self) -> Real {
+        crate::geometry::solver_contacts_tangential_extent(*self.normal, self.solver_contacts)
+    }
+
     /// Helper function to update `self` to emulate a oneway-platform.
     ///
     /// The "oneway" behavior will only allow contacts between two colliders
@@ -261,8 +295,11 @@ pub trait PhysicsHooks: Send + Sync {
     ///
     /// The world-space contact normal can be modified in `context.normal`.
     ///
-    /// An attractive adhesion force pulling the two bodies together can be requested through
-    /// `context.adhesion_force`; see [`ContactModificationContext::adhesion_force`].
+    /// An attractive adhesion pulling the two bodies together can be requested through
+    /// `context.adhesion_force` (absolute force per manifold) or `context.adhesion_pressure`
+    /// (force per unit of contact extent — composition-invariant); see
+    /// [`ContactModificationContext::adhesion_force`] and
+    /// [`ContactModificationContext::adhesion_pressure`].
     fn modify_solver_contacts(&self, _context: &mut ContactModificationContext) {}
 }
 

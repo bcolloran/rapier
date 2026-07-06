@@ -349,8 +349,28 @@ pub struct ContactManifoldData {
     ///
     /// Applied along [`Self::normal`] (spread over [`Self::solver_contacts`]) before the solver
     /// runs. `0.0` (default) is an ordinary contact; non-positive values ignored; reset each step.
+    ///
+    /// This is an absolute force *per manifold*: a surface split into N colliders produces ~N
+    /// manifolds and therefore ~N× the total pull. For adhesion that behaves identically on a
+    /// monolithic surface and on the same surface decomposed into many small colliders, use
+    /// [`Self::adhesion_pressure`] instead.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub adhesion_force: Real,
+    /// Attractive adhesion *pressure* pulling the two bodies together, expressed per unit of
+    /// contact patch: force per meter of contact length in 2D, force per square meter of contact
+    /// area in 3D.
+    ///
+    /// The resulting force for this manifold is `adhesion_pressure * tangential_extent()`, applied
+    /// exactly like [`Self::adhesion_force`] (the two add up). Because the contact spans of
+    /// abutting colliders partition the body's total contact patch, this formulation is
+    /// composition-invariant: splitting one big collider into many small ones leaves the total
+    /// adhesion force (and its torque) unchanged. The flip side is that point contacts (2D) and
+    /// point/line contacts (3D) have zero extent and receive no pressure adhesion — use
+    /// [`Self::adhesion_force`] for those.
+    ///
+    /// `0.0` (default) is an ordinary contact; non-positive values ignored; reset each step.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub adhesion_pressure: Real,
 }
 
 /// A single solver contact.
@@ -611,6 +631,7 @@ impl ContactManifoldData {
             relative_dominance: 0,
             user_data: 0,
             adhesion_force: 0.0,
+            adhesion_pressure: 0.0,
         }
     }
 
@@ -620,6 +641,83 @@ impl ContactManifoldData {
     pub fn num_active_contacts(&self) -> usize {
         self.solver_contacts.len()
     }
+
+    /// The tangential extent of this manifold's contact patch, measured from its solver contacts:
+    /// the spread of the contact points perpendicular to [`Self::normal`] (a length in 2D, an
+    /// area in 3D).
+    ///
+    /// This is what [`Self::adhesion_pressure`] gets multiplied by. Manifolds with fewer than 2
+    /// (2D) / 3 (3D) solver contacts — point and line contacts — have zero extent. Assumes
+    /// `normal` is unit-length.
+    #[inline]
+    pub fn tangential_extent(&self) -> Real {
+        solver_contacts_tangential_extent(self.normal, &self.solver_contacts)
+    }
+}
+
+/// Tangential extent (2D: length, 3D: area) of a set of solver contacts perpendicular to `normal`.
+#[cfg(feature = "dim2")]
+pub(crate) fn solver_contacts_tangential_extent(
+    normal: Vector,
+    contacts: &[SolverContact],
+) -> Real {
+    use crate::utils::OrthonormalBasis;
+
+    if contacts.len() < 2 {
+        return 0.0;
+    }
+
+    let tangent = normal.orthonormal_vector();
+    let mut min_s = tangent.dot(contacts[0].point);
+    let mut max_s = min_s;
+    for contact in &contacts[1..] {
+        let s = tangent.dot(contact.point);
+        min_s = min_s.min(s);
+        max_s = max_s.max(s);
+    }
+    max_s - min_s
+}
+
+/// Tangential extent (2D: length, 3D: area) of a set of solver contacts perpendicular to `normal`.
+///
+/// In 3D this is the area of the polygon formed by the contact points projected on the plane
+/// orthogonal to `normal` (points ordered by angle about their centroid), which is exact for
+/// contact points in convex position — the case produced by the narrow phase.
+#[cfg(feature = "dim3")]
+pub(crate) fn solver_contacts_tangential_extent(
+    normal: Vector,
+    contacts: &[SolverContact],
+) -> Real {
+    use crate::utils::OrthonormalBasis;
+
+    if contacts.len() < 3 {
+        return 0.0;
+    }
+
+    let [b1, b2] = normal.orthonormal_basis();
+    let mut pts: Vec<[Real; 2]> = contacts
+        .iter()
+        .map(|c| [b1.dot(c.point), b2.dot(c.point)])
+        .collect();
+
+    let inv_len = 1.0 / pts.len() as Real;
+    let cx = pts.iter().map(|p| p[0]).sum::<Real>() * inv_len;
+    let cy = pts.iter().map(|p| p[1]).sum::<Real>() * inv_len;
+    pts.sort_by(|a, b| {
+        let angle_a = (a[1] - cy).atan2(a[0] - cx);
+        let angle_b = (b[1] - cy).atan2(b[0] - cx);
+        angle_a
+            .partial_cmp(&angle_b)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+
+    let mut twice_area = 0.0;
+    for i in 0..pts.len() {
+        let p = pts[i];
+        let q = pts[(i + 1) % pts.len()];
+        twice_area += p[0] * q[1] - q[0] * p[1];
+    }
+    (twice_area * 0.5).abs()
 }
 
 /// Additional methods for the contact manifold.

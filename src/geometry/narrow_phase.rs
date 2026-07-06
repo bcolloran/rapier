@@ -1082,6 +1082,7 @@ impl NarrowPhase {
                         // Adhesion is re-requested by the hook each step (not persistent like
                         // `user_data`).
                         let mut modifiable_adhesion_force = 0.0;
+                        let mut modifiable_adhesion_pressure = 0.0;
 
                         let mut context = ContactModificationContext {
                             bodies,
@@ -1095,6 +1096,7 @@ impl NarrowPhase {
                             normal: &mut modifiable_normal,
                             user_data: &mut modifiable_user_data,
                             adhesion_force: &mut modifiable_adhesion_force,
+                            adhesion_pressure: &mut modifiable_adhesion_pressure,
                         };
 
                         hooks.modify_solver_contacts(&mut context);
@@ -1103,6 +1105,13 @@ impl NarrowPhase {
                         manifold.data.normal = modifiable_normal;
                         manifold.data.user_data = modifiable_user_data;
                         manifold.data.adhesion_force = modifiable_adhesion_force;
+                        manifold.data.adhesion_pressure = modifiable_adhesion_pressure;
+                    } else {
+                        // Adhesion must be re-requested each step: if the hook flag was removed
+                        // while this manifold is alive, the last requested value must not linger
+                        // as a phantom force.
+                        manifold.data.adhesion_force = 0.0;
+                        manifold.data.adhesion_pressure = 0.0;
                     }
                 }
             }
