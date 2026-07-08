@@ -1,5 +1,7 @@
 use crate::dynamics::{RigidBodyHandle, RigidBodySet};
-use crate::geometry::{ColliderHandle, ColliderSet, ContactManifold, SolverContact, SolverFlags};
+use crate::geometry::{
+    AdhesionBudget, ColliderHandle, ColliderSet, ContactManifold, SolverContact, SolverFlags,
+};
 use crate::math::{Real, Vector};
 use na::ComplexField;
 
@@ -68,6 +70,17 @@ pub struct ContactModificationContext<'a> {
     /// adhesion; use `adhesion_force` for those. Reset to `0.0` before each call; non-positive
     /// values are ignored.
     pub adhesion_pressure: &'a mut Real,
+    /// Enrolls this manifold in a *budgeted* adhesion pool; see [`AdhesionBudget`].
+    ///
+    /// All manifolds enrolled with the same `(owner, channel)` key during the same timestep share
+    /// a single total adhesion force (the maximum of their requested totals), distributed over
+    /// them proportionally to their tangential extent (with a small floor so point contacts
+    /// participate). Use this when one number should mean "this region of my body is exactly this
+    /// sticky" regardless of how many colliders, tiles, overlaps, or seams implement the contact.
+    ///
+    /// Adds up with [`Self::adhesion_force`] and [`Self::adhesion_pressure`] if those are also
+    /// set. Reset to `None` before each call.
+    pub adhesion_budget: &'a mut Option<AdhesionBudget>,
 }
 
 impl ContactModificationContext<'_> {
@@ -296,10 +309,12 @@ pub trait PhysicsHooks: Send + Sync {
     /// The world-space contact normal can be modified in `context.normal`.
     ///
     /// An attractive adhesion pulling the two bodies together can be requested through
-    /// `context.adhesion_force` (absolute force per manifold) or `context.adhesion_pressure`
-    /// (force per unit of contact extent — composition-invariant); see
-    /// [`ContactModificationContext::adhesion_force`] and
-    /// [`ContactModificationContext::adhesion_pressure`].
+    /// `context.adhesion_force` (absolute force per manifold), `context.adhesion_pressure`
+    /// (force per unit of contact extent — composition-invariant), or `context.adhesion_budget`
+    /// (a fixed total shared by all manifolds of a pool — composition- *and* overlap-invariant);
+    /// see [`ContactModificationContext::adhesion_force`],
+    /// [`ContactModificationContext::adhesion_pressure`] and
+    /// [`ContactModificationContext::adhesion_budget`].
     fn modify_solver_contacts(&self, _context: &mut ContactModificationContext) {}
 }
 

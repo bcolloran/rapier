@@ -44,6 +44,7 @@ mod adhesion_climb2;
 mod adhesion_curved2;
 mod adhesion_grid2;
 mod adhesion_slide2;
+mod adhesion_teeter2;
 mod sensor2;
 mod stress_tests;
 #[cfg(not(target_arch = "wasm32"))]
@@ -96,6 +97,7 @@ pub async fn main() {
         Example::new(DYNAMICS, "Adhesion (curved)", adhesion_curved2::init_world),
         Example::new(DYNAMICS, "Adhesion climb", adhesion_climb2::init_world),
         Example::new(DYNAMICS, "Adhesion slide", adhesion_slide2::init_world),
+        Example::new(DYNAMICS, "Adhesion teeter", adhesion_teeter2::init_world),
         // ── Joints ─────────────────────────────────────────────────────────
         Example::new(JOINTS, "Joints", joints2::init_world),
         Example::new(JOINTS, "Rope Joints", rope_joints2::init_world),

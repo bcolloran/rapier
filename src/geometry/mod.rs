@@ -6,8 +6,8 @@ pub use self::collider::{Collider, ColliderBuilder};
 pub use self::collider_components::*;
 pub use self::collider_set::{ColliderSet, ModifiedColliders};
 pub use self::contact_pair::{
-    ContactData, ContactManifoldData, ContactPair, IntersectionPair, SimdSolverContact,
-    SolverContact, SolverFlags,
+    AdhesionBudget, ContactData, ContactManifoldData, ContactPair, IntersectionPair,
+    SimdSolverContact, SolverContact, SolverFlags,
 };
 pub(crate) use self::contact_pair::solver_contacts_tangential_extent;
 pub use self::interaction_graph::{

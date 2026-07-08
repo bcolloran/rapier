@@ -2,54 +2,58 @@ use kiss3d::color::Color;
 use rapier_testbed2d::Testbed;
 use rapier2d::prelude::*;
 
-/// Friction-solver / multi-collider equivalence test (prerequisite for trusting adhesion across
-/// multiple contacts).
+/// Side-by-side comparison of the three adhesion request flavors on surfaces that *should* behave
+/// identically.
 ///
 /// A capsule lies lengthwise on a straight slope and slides down under gravity. Each slope is 10
-/// units long but is built two different ways that *should* behave identically:
+/// units long but is built two different ways:
 /// - a **single** rectangle collider, or
 /// - **10 unit squares** laid end-to-end, striped light/dark gray so the seams are visible (a
 ///   sliding body crosses 9 seams and is usually in contact with 2–3 square colliders at once —
 ///   the tricky boundary condition).
 ///
 /// Four dimensions are varied at once:
-/// - **Row blocks (y): adhesion force**, 0 at the bottom, increasing upward.
+/// - **Row blocks (y): adhesion magnitude** (total newtons over the capsule's 2 m flat side),
+///   0 at the bottom, increasing upward.
 /// - **Outer column groups (x): slope angle** — 20°, then 40°, then 60° from horizontal.
-/// - **Inner 2×2 per block/group intersection:**
-///   - columns: single rectangle (left) vs. the 10-square strip (right);
-///   - rows: friction from the **collider builder** (lower, the usual path) vs. friction forced by
-///     the **contact-modification hook** (upper, blue-tinted capsule). The hook capsules are built
-///     with friction 0 and the hook overwrites every solver contact's `friction` to the same
-///     combined value the builder path produces — if Rapier used anything but the per-contact
-///     value, or contact modification interfered with the friction solver's bookkeeping, the two
-///     sub-rows would diverge.
-///
-/// The capsule (cap radius 0.5, total length 3, so a 2-unit flat side) starts at the high end with
-/// its flat side resting on the top 2 m of the slope.
+/// - **Inner columns per group:** single rectangle (left) vs. the 10-square strip (right).
+/// - **Sub-rows within a block: how the adhesion is requested** —
+///   - bottom: `adhesion_force` (absolute force *per manifold*),
+///   - middle: `adhesion_pressure` (force per meter of contact length; blue-tinted capsule),
+///   - top: `adhesion_budget` (fixed total shared by all of the capsule's manifolds; bright blue).
 ///
 /// What to look for:
-/// - **Bottom block (zero adhesion)** is the friction-solver baseline: all four members of each
-///   2×2 must slide *identically* (same speed, same final position). At 20° the capsule stays put
-///   (tan 20° < μ = 0.5); at 40° and 60° it slides. Friction cannot "double count" across the
-///   squares because the solver bounds each contact's friction by μ × that contact's *solved
-///   normal impulse*, and the normal impulses always partition the capsule's weight no matter how
-///   many colliders carry it. Hook-set friction feeds the exact same per-contact value, so it
-///   inherits the same invariance.
-/// - **Adhesion blocks** then probe adhesion across multiple colliders, using the
-///   composition-invariant `adhesion_pressure` request (force per meter of contact length). The
-///   old per-manifold `adhesion_force` would give the segmented strip ~3× the pull (one manifold
-///   per straddled square) — the strip would lock while its rectangle twin still creeps. With
-///   pressure, the squares' contact spans partition the capsule's 2 m patch, so both compositions
-///   receive the same total pull: every 2×2 must stay fully symmetric, matching the zero-adhesion
-///   baseline's symmetry. Any rect-vs-strip divergence in an adhesion block is a regression.
+/// - **Bottom block (zero adhesion)** is the friction baseline: all six members of each group must
+///   slide *identically*. At 20° the capsule stays put (tan 20° < μ = 0.5); at 40° and 60° it
+///   slides. Friction cannot double count across the squares because the solver bounds each
+///   contact's friction by μ × that contact's *solved normal impulse*, and normal impulses always
+///   partition the capsule's weight no matter how many colliders carry it.
+/// - **`adhesion_force` sub-rows show the double-counting bug**: the request is per manifold, and
+///   the strip presents one manifold per straddled square (~3 at once), so the strip capsule gets
+///   ~3× the pull of its rectangle twin — expect it to cling harder / lock while the rectangle
+///   still creeps (clearest around 40° at 12 N).
+/// - **`adhesion_pressure` sub-rows are composition-invariant**: the squares' contact spans
+///   partition the capsule's 2 m patch, so both compositions receive the same total pull — the
+///   rect/strip pair must behave identically, matching the baseline's symmetry.
+/// - **`adhesion_budget` sub-rows are also invariant** (the pool total is shared by however many
+///   manifolds enroll), and additionally would stay invariant under *overlapping* colliders and
+///   keep working on point contacts — cases where pressure falls short.
+#[derive(Clone, Copy, PartialEq)]
+enum AdhesionMode {
+    /// `adhesion_force`: absolute per-manifold force — multiplies with the manifold count.
+    Force,
+    /// `adhesion_pressure`: force per meter of contact — composition-invariant.
+    Pressure,
+    /// `adhesion_budget`: fixed total shared by the capsule's manifolds — composition- and
+    /// overlap-invariant.
+    Budget,
+}
+
 struct CapsuleParams {
     handle: ColliderHandle,
-    /// Total adhesion (in force units) over the capsule's 2-unit flat side; the hook requests it
-    /// as a pressure of `adhesion / 2` per meter, which is composition-invariant.
+    /// Total adhesion (in force units) over the capsule's 2-unit flat side.
     adhesion: Real,
-    /// If set, the capsule collider was built frictionless and the hook re-applies FRICTION on
-    /// every solver contact — testing that hook-set friction behaves like builder-set friction.
-    hook_friction: bool,
+    mode: AdhesionMode,
 }
 
 struct AdhesionSlideHook {
@@ -60,18 +64,24 @@ impl PhysicsHooks for AdhesionSlideHook {
     fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
         for params in &self.capsules {
             if context.collider1 == params.handle || context.collider2 == params.handle {
-                if params.adhesion > 0.0 {
-                    // Requested as a *pressure* (force per meter of contact length): each straddled
-                    // square's manifold contributes proportionally to its share of the capsule's
-                    // 2 m flat side, so the strip totals the same pull as the single rectangle.
-                    *context.adhesion_pressure = params.adhesion / CAP_FLAT_SIDE;
-                }
-                if params.hook_friction {
-                    // `SolverContact::friction` is the already-combined coefficient for this
-                    // contact point; write the same value the builder path yields (Average of
-                    // 0.5 and 0.5).
-                    for contact in context.solver_contacts.iter_mut() {
-                        contact.friction = FRICTION;
+                match params.mode {
+                    AdhesionMode::Force => {
+                        // Per manifold — each straddled square adds a full copy (the bug).
+                        *context.adhesion_force = params.adhesion;
+                    }
+                    AdhesionMode::Pressure => {
+                        // Per meter of contact — the straddled squares' spans partition the 2 m
+                        // flat side, so the strip totals the same pull as the rectangle.
+                        *context.adhesion_pressure = params.adhesion / CAP_FLAT_SIDE;
+                    }
+                    AdhesionMode::Budget => {
+                        // Fixed total shared by every manifold of this capsule's pool, however
+                        // many colliders implement the contact.
+                        *context.adhesion_budget = Some(AdhesionBudget {
+                            owner: params.handle,
+                            channel: 0,
+                            total: params.adhesion,
+                        });
                     }
                 }
                 return;
@@ -90,8 +100,8 @@ const FRICTION: Real = 0.5;
 const GRAVITY: Real = 9.81;
 
 /// One grid cell: a fixed slope (single rectangle or 10 striped squares) plus a capsule resting
-/// flat on its top 2 m, plus a catch floor below. Registers the capsule with the hook if it needs
-/// adhesion or hook-driven friction.
+/// flat on its top 2 m, plus a catch floor below. Registers the capsule with the hook if it
+/// requests adhesion.
 #[allow(clippy::too_many_arguments)]
 fn add_cell(
     bodies: &mut RigidBodySet,
@@ -101,7 +111,7 @@ fn add_cell(
     angle_deg: Real,
     squares: bool,
     adhesion: Real,
-    hook_friction: bool,
+    mode: AdhesionMode,
     color: Color,
     hook_capsules: &mut Vec<CapsuleParams>,
 ) {
@@ -161,21 +171,19 @@ fn add_cell(
             .translation(cap_center)
             .rotation(theta),
     );
-    // Hook-friction capsules are built frictionless: everything they get, the hook must provide.
-    let builder_friction = if hook_friction { 0.0 } else { FRICTION };
-    let mut capsule =
-        ColliderBuilder::capsule_x(CAP_HALF_HEIGHT, CAP_RADIUS).friction(builder_friction);
-    let needs_hook = adhesion > 0.0 || hook_friction;
-    if needs_hook {
+    let mut capsule = ColliderBuilder::capsule_x(CAP_HALF_HEIGHT, CAP_RADIUS).friction(FRICTION);
+    if adhesion > 0.0 {
+        // Only adhering capsules enable the hook, so the zero-adhesion baseline block is pure
+        // default behavior.
         capsule = capsule.active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS);
     }
     let capsule = colliders.insert_with_parent(capsule, cap_body, bodies);
     testbed.set_initial_collider_color(capsule, color);
-    if needs_hook {
+    if adhesion > 0.0 {
         hook_capsules.push(CapsuleParams {
             handle: capsule,
             adhesion,
-            hook_friction,
+            mode,
         });
     }
 }
@@ -190,27 +198,39 @@ pub fn init_world(testbed: &mut Testbed) {
     let angles = [20.0, 40.0, 60.0];
     let adhesions = [0.0, 12.0, 25.0, 45.0]; // bottom block → top block
     let max_adhesion = 45.0;
+    // Bottom → top within a block. In the zero-adhesion block the mode is irrelevant (three
+    // identical baselines); everywhere else the force sub-row is the one that misbehaves on the
+    // strip.
+    let modes = [
+        AdhesionMode::Force,
+        AdhesionMode::Pressure,
+        AdhesionMode::Budget,
+    ];
 
     const PAIR_DX: Real = 13.0; // rectangle ↔ square strip within an angle group
     const GROUP_DX: Real = 34.0; // angle group ↔ angle group
-    const SUB_DY: Real = 15.0; // builder-friction ↔ hook-friction within an adhesion block
-    const BLOCK_DY: Real = 34.0; // adhesion block ↔ adhesion block
+    const SUB_DY: Real = 15.0; // force ↔ pressure ↔ budget within an adhesion block
+    const BLOCK_DY: Real = 49.0; // adhesion block ↔ adhesion block (3 sub-rows + gap)
 
     let x_center = (2.0 * GROUP_DX + PAIR_DX) / 2.0;
-    let y_center = ((adhesions.len() as Real - 1.0) * BLOCK_DY + SUB_DY) / 2.0;
+    let y_center = ((adhesions.len() as Real - 1.0) * BLOCK_DY
+        + (modes.len() as Real - 1.0) * SUB_DY)
+        / 2.0;
 
     for (gi, &angle) in angles.iter().enumerate() {
         for (ci, &squares) in [false, true].iter().enumerate() {
             let x = gi as Real * GROUP_DX + ci as Real * PAIR_DX - x_center;
             for (ri, &adhesion) in adhesions.iter().enumerate() {
-                // Lower sub-row: friction from the collider builder (the baseline path).
-                // Upper sub-row: friction forced per-contact by the hook (blue-tinted capsule).
-                for (fi, &hook_friction) in [false, true].iter().enumerate() {
-                    let y = ri as Real * BLOCK_DY + fi as Real * SUB_DY - y_center;
-                    // Capsule colour: red (no adhesion) → green (strong) by block; the blue channel
-                    // marks the hook-friction sub-row.
+                for (mi, &mode) in modes.iter().enumerate() {
+                    let y = ri as Real * BLOCK_DY + mi as Real * SUB_DY - y_center;
+                    // Capsule colour: red (no adhesion) → green (strong) by block; the blue
+                    // channel marks the request flavor (force 0.1, pressure 0.55, budget 1.0).
                     let frac = adhesion / max_adhesion;
-                    let blue = if hook_friction { 0.9 } else { 0.15 };
+                    let blue = match mode {
+                        AdhesionMode::Force => 0.1,
+                        AdhesionMode::Pressure => 0.55,
+                        AdhesionMode::Budget => 1.0,
+                    };
                     let color = Color::new(1.0 - frac, frac, blue, 1.0);
                     add_cell(
                         &mut bodies,
@@ -220,7 +240,7 @@ pub fn init_world(testbed: &mut Testbed) {
                         angle,
                         squares,
                         adhesion,
-                        hook_friction,
+                        mode,
                         color,
                         &mut hook_capsules,
                     );
@@ -241,5 +261,5 @@ pub fn init_world(testbed: &mut Testbed) {
         Vector::new(0.0, -GRAVITY),
         physics_hooks,
     );
-    testbed.look_at(Vec2::new(0.0, 0.0), 5.5);
+    testbed.look_at(Vec2::new(0.0, 0.0), 3.6);
 }

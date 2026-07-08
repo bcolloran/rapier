@@ -18,6 +18,7 @@ use crate::math::{Real, Vector};
 use crate::pipeline::{EventHandler, PhysicsHooks};
 use crate::prelude::{Collider, ModifiedRigidBodies, RigidBody, RigidBodyHandle};
 use crate::utils::CrossProduct;
+use parry::utils::hashmap::HashMap;
 use {crate::dynamics::RigidBodySet, crate::geometry::ColliderSet};
 
 /// The main physics simulation engine that runs your physics world forward in time.
@@ -262,9 +263,35 @@ impl PhysicsPipeline {
         // per-step effective force/torque. Runs after gravity and before the solver, so the
         // push-only contacts react to it this step.
         //
-        // Two request flavors add up: `adhesion_force` (absolute, per manifold) and
+        // Three request flavors add up: `adhesion_force` (absolute, per manifold),
         // `adhesion_pressure` (per unit of contact extent — composition-invariant, since the
-        // contact spans of abutting colliders partition the body's total contact patch).
+        // contact spans of abutting colliders partition the body's total contact patch), and
+        // `adhesion_budget` (a fixed total shared by every manifold enrolled in the same
+        // `(owner, channel)` pool this step — composition- and overlap-invariant by construction).
+
+        // Weight floor for budget distribution: keeps point contacts (zero tangential extent) in
+        // the pool — a lone point contact receives the full budget, while a degenerate sliver
+        // manifold alongside real area contacts receives almost nothing.
+        const BUDGET_MIN_WEIGHT: Real = 1.0e-3;
+
+        // Budget pools: (owner, channel) -> (pool total = max of requests, sum of weights).
+        // Built only if some manifold enrolled in a pool; queried (never iterated) in the
+        // application loop below, so determinism follows the manifold iteration order.
+        let mut budget_pools: Option<HashMap<(ColliderHandle, u32), (Real, Real)>> = None;
+        for manifold in &manifolds {
+            if let Some(budget) = &manifold.data.adhesion_budget {
+                if budget.total > 0.0 && !manifold.data.solver_contacts.is_empty() {
+                    let weight = manifold.data.tangential_extent().max(BUDGET_MIN_WEIGHT);
+                    let pools = budget_pools.get_or_insert_with(HashMap::default);
+                    let entry = pools
+                        .entry((budget.owner, budget.channel))
+                        .or_insert((0.0, 0.0));
+                    entry.0 = entry.0.max(budget.total);
+                    entry.1 += weight;
+                }
+            }
+        }
+
         for manifold in &manifolds {
             let num_contacts = manifold.data.solver_contacts.len();
             if num_contacts == 0 {
@@ -275,6 +302,18 @@ impl PhysicsPipeline {
             let adhesion_pressure = manifold.data.adhesion_pressure.max(0.0);
             if adhesion_pressure > 0.0 {
                 adhesion_force += adhesion_pressure * manifold.data.tangential_extent();
+            }
+            if let (Some(pools), Some(budget)) = (&budget_pools, &manifold.data.adhesion_budget) {
+                if budget.total > 0.0 {
+                    if let Some((pool_total, pool_weight)) =
+                        pools.get(&(budget.owner, budget.channel))
+                    {
+                        let weight = manifold.data.tangential_extent().max(BUDGET_MIN_WEIGHT);
+                        // This manifold's share of the pool; the shares of a pool sum to exactly
+                        // `pool_total` no matter how many manifolds are enrolled.
+                        adhesion_force += pool_total * (weight / pool_weight);
+                    }
+                }
             }
             if adhesion_force == 0.0 {
                 continue;
@@ -3696,16 +3735,34 @@ mod adhesion_test {
         }
     }
 
-    /// A capsule (2-unit flat side) lying on the top 2 m of a 10-unit slope at 40°, built either
-    /// as a single rectangle or as 10 abutting unit squares under one fixed body. Returns the
-    /// capsule collider (hook-enabled) and body.
-    fn slope_and_capsule(world: &mut World, segmented: bool) -> (ColliderHandle, RigidBodyHandle) {
+    /// How the 10-unit test slope is decomposed into colliders.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Slope {
+        /// One 10-unit rectangle.
+        Rect,
+        /// 10 abutting unit squares (a body straddles 2-3 of them).
+        Tiles,
+        /// 10 abutting unit squares PLUS 9 more shifted by half a tile, co-planar tops: almost
+        /// the whole surface is covered by TWO overlapping colliders.
+        OverlappingTiles,
+    }
+
+    /// A capsule (2-unit flat side) lying on the top 2 m of a 10-unit slope at 40°, decomposed
+    /// per `slope`, all surface colliders under one fixed body. Returns the capsule collider
+    /// (hook-enabled) and body.
+    fn slope_and_capsule(world: &mut World, slope: Slope) -> (ColliderHandle, RigidBodyHandle) {
         let theta = (40.0 as Real).to_radians();
         let up_slope = Vector::new(theta.cos(), theta.sin());
         let top_normal = Vector::new(-theta.sin(), theta.cos());
 
         let statics = world.bodies.insert(RigidBodyBuilder::fixed());
-        if segmented {
+        if slope == Slope::Rect {
+            world.colliders.insert_with_parent(
+                ColliderBuilder::cuboid(5.0, 0.5).rotation(theta).friction(0.5),
+                statics,
+                &mut world.bodies,
+            );
+        } else {
             for k in 0..10 {
                 let s = -4.5 + k as Real;
                 world.colliders.insert_with_parent(
@@ -3717,12 +3774,21 @@ mod adhesion_test {
                     &mut world.bodies,
                 );
             }
-        } else {
-            world.colliders.insert_with_parent(
-                ColliderBuilder::cuboid(5.0, 0.5).rotation(theta).friction(0.5),
-                statics,
-                &mut world.bodies,
-            );
+            if slope == Slope::OverlappingTiles {
+                // Second, half-tile-shifted layer of tiles with the SAME top surface: doubled
+                // coverage without changing the geometry a sliding body sees.
+                for k in 0..9 {
+                    let s = -4.0 + k as Real;
+                    world.colliders.insert_with_parent(
+                        ColliderBuilder::cuboid(0.5, 0.5)
+                            .translation(up_slope * s)
+                            .rotation(theta)
+                            .friction(0.5),
+                        statics,
+                        &mut world.bodies,
+                    );
+                }
+            }
         }
 
         // Flat side covers the top 2 m of the slope (s in [3, 5]).
@@ -3749,9 +3815,9 @@ mod adhesion_test {
         // square-strip capsule locks solid. `adhesion_pressure` must not: with P = 12 N / 2 m,
         // both compositions get 12 N total and must creep the same distance.
         let pressure = 6.0; // N per meter over the 2-unit flat side => 12 N total
-        let run = |segmented: bool| -> Real {
+        let run = |slope: Slope| -> Real {
             let mut world = World::new(Vector::new(0.0, -G));
-            let (capsule, cap_body) = slope_and_capsule(&mut world, segmented);
+            let (capsule, cap_body) = slope_and_capsule(&mut world, slope);
             let hook = PressureHook {
                 collider: capsule,
                 pressure,
@@ -3763,8 +3829,8 @@ mod adhesion_test {
             -(end - start).dot(Vector::new(theta.cos(), theta.sin()))
         };
 
-        let d_rect = run(false);
-        let d_strip = run(true);
+        let d_rect = run(Slope::Rect);
+        let d_strip = run(Slope::Tiles);
 
         // Both creep (neither locks — a lock here is the force-mode double-counting bug)...
         assert!(d_rect > 0.5, "rectangle capsule should creep (slid {d_rect})");
@@ -3780,7 +3846,7 @@ mod adhesion_test {
         let force = 12.0;
         let run = |use_pressure: bool| -> Real {
             let mut world = World::new(Vector::new(0.0, -G));
-            let (capsule, cap_body) = slope_and_capsule(&mut world, false);
+            let (capsule, cap_body) = slope_and_capsule(&mut world, Slope::Rect);
             let start = world.bodies[cap_body].translation();
             if use_pressure {
                 let hook = PressureHook {
@@ -3903,5 +3969,316 @@ mod adhesion_test {
         let negative = drop(-30.0);
         assert!(zero > 0.5, "box should fall under gravity with no adhesion");
         assert_abs_diff_eq!(negative, zero, epsilon = 1.0e-3);
+    }
+
+    /*
+     * Budgeted adhesion (`ContactModificationContext::adhesion_budget`): a fixed total shared by
+     * all manifolds of an (owner, channel) pool in the same step. Headline properties: the total
+     * is invariant under surface decomposition AND collider overlap, and a lone point contact
+     * still receives the full total.
+     */
+
+    /// Enrolls every manifold involving `collider` in one budget pool with the given total.
+    struct BudgetHook {
+        collider: ColliderHandle,
+        total: Real,
+    }
+
+    impl PhysicsHooks for BudgetHook {
+        fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+            if context.collider1 == self.collider || context.collider2 == self.collider {
+                *context.adhesion_budget = Some(AdhesionBudget {
+                    owner: self.collider,
+                    channel: 0,
+                    total: self.total,
+                });
+            }
+        }
+    }
+
+    /// Down-slope distance slid in 3 s by a budgeted capsule on the given slope decomposition.
+    fn budget_slide(slope: Slope, total: Real) -> Real {
+        let mut world = World::new(Vector::new(0.0, -G));
+        let (capsule, cap_body) = slope_and_capsule(&mut world, slope);
+        let hook = BudgetHook {
+            collider: capsule,
+            total,
+        };
+        let start = world.bodies[cap_body].translation();
+        world.step(&hook, 180);
+        let end = world.bodies[cap_body].translation();
+        let theta = (40.0 as Real).to_radians();
+        -(end - start).dot(Vector::new(theta.cos(), theta.sin()))
+    }
+
+    #[test]
+    fn budget_is_composition_and_overlap_invariant_on_slope() {
+        // The same 12 N budget must produce the same creep whether the slope is one rectangle,
+        // 10 abutting tiles, or 19 OVERLAPPING tiles (double coverage) — the overlap case is the
+        // one `adhesion_pressure` cannot handle (overlapping spans double the measured extent).
+        let d_rect = budget_slide(Slope::Rect, 12.0);
+        let d_tiles = budget_slide(Slope::Tiles, 12.0);
+        let d_overlap = budget_slide(Slope::OverlappingTiles, 12.0);
+
+        assert!(d_rect > 0.5, "rectangle capsule should creep (slid {d_rect})");
+        assert!(d_tiles > 0.5, "tiled capsule should creep (slid {d_tiles})");
+        assert!(
+            d_overlap > 0.5,
+            "overlapping-tiles capsule should creep (slid {d_overlap})"
+        );
+        assert_abs_diff_eq!(d_rect, d_tiles, epsilon = 0.15);
+        assert_abs_diff_eq!(d_rect, d_overlap, epsilon = 0.15);
+    }
+
+    #[test]
+    fn budget_matches_equivalent_force_on_monolithic_surface() {
+        // A pool with a single enrolled manifold is exactly `adhesion_force`.
+        let d_budget = budget_slide(Slope::Rect, 12.0);
+        let mut world = World::new(Vector::new(0.0, -G));
+        let (capsule, cap_body) = slope_and_capsule(&mut world, Slope::Rect);
+        let hook = AdhesionHook {
+            collider: capsule,
+            force: 12.0,
+        };
+        let start = world.bodies[cap_body].translation();
+        world.step(&hook, 180);
+        let end = world.bodies[cap_body].translation();
+        let theta = (40.0 as Real).to_radians();
+        let d_force = -(end - start).dot(Vector::new(theta.cos(), theta.sin()));
+
+        assert_abs_diff_eq!(d_budget, d_force, epsilon = 1.0e-3);
+    }
+
+    #[test]
+    fn budget_total_is_capped_across_seam_straddling_manifolds() {
+        // A box hangs under a ceiling made of TWO tiles, its top face straddling the seam: two
+        // manifolds share the pool. The hold threshold must be the pool total — not 2x it, which
+        // is what per-manifold `adhesion_force` gives.
+        let run = |budgeted: bool, load: Real| -> Real {
+            let mut world = World::new(Vector::new(0.0, -G));
+            let ceiling_body = world.bodies.insert(RigidBodyBuilder::fixed());
+            for k in [-1.0, 1.0] {
+                world.colliders.insert_with_parent(
+                    ColliderBuilder::cuboid(1.0, 0.5)
+                        .translation(Vector::new(k, 0.5))
+                        .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+                    ceiling_body,
+                    &mut world.bodies,
+                );
+            }
+            let box_body = world
+                .bodies
+                .insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, -0.5)));
+            let box_co = world.colliders.insert_with_parent(
+                ColliderBuilder::cuboid(0.5, 0.5),
+                box_body,
+                &mut world.bodies,
+            );
+            let w = world.bodies[box_body].mass() * G;
+            world.bodies[box_body].add_force(Vector::new(0.0, -load), true);
+
+            let total = w + 3.0;
+            if budgeted {
+                let hook = BudgetHook {
+                    collider: box_co,
+                    total,
+                };
+                world.step(&hook, 200);
+            } else {
+                let hook = AdhesionHook {
+                    collider: box_co,
+                    force: total,
+                };
+                world.step(&hook, 200);
+            }
+            world.bodies[box_body].translation().y
+        };
+
+        // Budget w + 3 vs load 5: total pull (w + 3) < weight + load (w + 5) => must break free.
+        let y = run(true, 5.0);
+        assert!(y < -1.0, "budgeted box should break free (y = {y})");
+        // ...but still holds a sub-threshold load.
+        let y = run(true, 1.0);
+        assert!(y > -0.6, "budgeted box should hold a 1 N load (y = {y})");
+        // Contrast: per-manifold force double-counts across the two manifolds (2w + 6 total pull)
+        // and wrongly survives the over-threshold load. This pins the difference.
+        let y = run(false, 5.0);
+        assert!(
+            y > -0.6,
+            "force-mode box should (incorrectly) keep hanging via 2x pull (y = {y})"
+        );
+    }
+
+    #[test]
+    fn budget_channels_are_independent_pools() {
+        // Same rig as the seam-straddling test, but the hook enrolls each ceiling tile's manifold
+        // in a DIFFERENT channel: two pools of (w + 3) each => 2w + 6 total pull, which holds the
+        // w + 5 load that a single shared pool (previous test) breaks under. This is the corner
+        // semantics: a body spends its feet budget AND its flank budget simultaneously.
+        struct TwoChannelHook {
+            collider: ColliderHandle,
+            total: Real,
+        }
+        impl PhysicsHooks for TwoChannelHook {
+            fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+                let other = if context.collider1 == self.collider {
+                    context.collider2
+                } else if context.collider2 == self.collider {
+                    context.collider1
+                } else {
+                    return;
+                };
+                // Channel keyed by which tile this manifold touches.
+                let (index, _) = other.0.into_raw_parts();
+                *context.adhesion_budget = Some(AdhesionBudget {
+                    owner: self.collider,
+                    channel: index,
+                    total: self.total,
+                });
+            }
+        }
+
+        let mut world = World::new(Vector::new(0.0, -G));
+        let ceiling_body = world.bodies.insert(RigidBodyBuilder::fixed());
+        for k in [-1.0, 1.0] {
+            world.colliders.insert_with_parent(
+                ColliderBuilder::cuboid(1.0, 0.5)
+                    .translation(Vector::new(k, 0.5))
+                    .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+                ceiling_body,
+                &mut world.bodies,
+            );
+        }
+        let box_body = world
+            .bodies
+            .insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, -0.5)));
+        let box_co = world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(0.5, 0.5),
+            box_body,
+            &mut world.bodies,
+        );
+        let w = world.bodies[box_body].mass() * G;
+        world.bodies[box_body].add_force(Vector::new(0.0, -5.0), true);
+
+        let hook = TwoChannelHook {
+            collider: box_co,
+            total: w + 3.0,
+        };
+        world.step(&hook, 200);
+
+        let y = world.bodies[box_body].translation().y;
+        assert!(
+            y > -0.6,
+            "two independent channels should hold the w + 5 load together (y = {y})"
+        );
+    }
+
+    #[test]
+    fn adhesion_applies_no_net_torque() {
+        // Wrench-neutrality: adhesion is an internal action-reaction pair, so it must contribute
+        // zero net torque to the system it acts within. Rig: a 10 m plank hung from a pivot 3 m
+        // above its center (a STABLE pendulum — unlike a center-pivot teeter, it cannot amplify
+        // numerical seeds), with a capsule standing 4 m out on EACH side and only the LEFT one
+        // adhering (20 N, ~2x its weight). Any steady net torque T from the adhesion would settle
+        // the plank at a permanent tilt ~T / (M g d); the 0.002 rad threshold detects ~0.1 N*m.
+        let run = |adhesion: Option<Real>| -> Real {
+            let mut world = World::new(Vector::new(0.0, -G));
+            let pivot = world
+                .bodies
+                .insert(RigidBodyBuilder::fixed().translation(Vector::new(0.0, 3.0)));
+            let plank_body = world.bodies.insert(
+                RigidBodyBuilder::dynamic()
+                    .angular_damping(2.0) // settle oscillations so the final angle is read at rest
+                    .can_sleep(false),
+            );
+            world.colliders.insert_with_parent(
+                ColliderBuilder::cuboid(5.0, 0.5).mass(1.0).friction(2.0),
+                plank_body,
+                &mut world.bodies,
+            );
+            world.impulse_joints.insert(
+                pivot,
+                plank_body,
+                RevoluteJointBuilder::new().local_anchor2(Vector::new(0.0, 3.0)),
+                true,
+            );
+
+            let mut adhesive_capsule = None;
+            for side in [-1.0 as Real, 1.0] {
+                let cap_body = world.bodies.insert(
+                    RigidBodyBuilder::dynamic()
+                        .translation(Vector::new(side * 4.0, 1.5))
+                        .lock_rotations()
+                        .can_sleep(false),
+                );
+                let adheres = side < 0.0 && adhesion.is_some();
+                let mut capsule = ColliderBuilder::capsule_y(0.5, 0.5).mass(1.0).friction(2.0);
+                if adheres {
+                    capsule = capsule.active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS);
+                }
+                let capsule =
+                    world
+                        .colliders
+                        .insert_with_parent(capsule, cap_body, &mut world.bodies);
+                if adheres {
+                    adhesive_capsule = Some(capsule);
+                }
+            }
+
+            match (adhesion, adhesive_capsule) {
+                (Some(force), Some(capsule)) => {
+                    let hook = AdhesionHook {
+                        collider: capsule,
+                        force,
+                    };
+                    world.step(&hook, 600);
+                }
+                _ => world.step(&(), 600),
+            }
+            world.bodies[plank_body].rotation().angle()
+        };
+
+        let level = run(None);
+        let adhering = run(Some(20.0));
+        assert!(
+            level.abs() < 0.002,
+            "control plank settled tilted ({level} rad)"
+        );
+        assert!(
+            adhering.abs() < 0.002,
+            "adhesion applied a steady net torque: plank settled at {adhering} rad"
+        );
+    }
+
+    #[test]
+    fn budget_point_contact_receives_full_total() {
+        // A ball under the ceiling is a single-point manifold: pressure adhesion is inert there,
+        // but a budget pool with one member hands it the full total, so the ball hangs.
+        let mut world = World::new(Vector::new(0.0, -G));
+        let ceiling_body = world.bodies.insert(RigidBodyBuilder::fixed());
+        world.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(5.0, 0.5)
+                .translation(Vector::new(0.0, 0.5))
+                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+            ceiling_body,
+            &mut world.bodies,
+        );
+        let ball_body = world
+            .bodies
+            .insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, -0.5)));
+        let ball_co = world.colliders.insert_with_parent(
+            ColliderBuilder::ball(0.5),
+            ball_body,
+            &mut world.bodies,
+        );
+
+        let hook = BudgetHook {
+            collider: ball_co,
+            total: 30.0, // ball weighs ~7.7 N
+        };
+        world.step(&hook, 300);
+
+        let y = world.bodies[ball_body].translation().y;
+        assert!(y > -0.6, "ball fell to y = {y} despite a 30 N budget");
     }
 }
