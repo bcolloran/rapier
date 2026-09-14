@@ -1161,3 +1161,87 @@ fn step_collisions_last_snapshot_roundtrip() {
     check_snapshot_roundtrip_after_contact_start(45);
     check_snapshot_roundtrip_after_contact_start(80);
 }
+
+/// A stack of `count` boxes resting on a fixed floor whose top is at `y = 0.1`, bottom box first.
+fn box_stack(count: usize) -> (PhysicsWorld, Vec<RigidBodyHandle>) {
+    let mut world = PhysicsWorld::new();
+    world.insert(RigidBodyBuilder::fixed(), cuboid(10.0, 0.1));
+    let boxes = (0..count)
+        .map(|i| {
+            world
+                .insert(
+                    RigidBodyBuilder::dynamic().translation(v(0.0, 0.6 + i as Real)),
+                    cuboid(0.5, 0.5),
+                )
+                .0
+        })
+        .collect();
+    (world, boxes)
+}
+
+/// Steps `world` (with `step`, or with `step_collisions_last`) until all `bodies` sleep.
+fn step_until_asleep(world: &mut PhysicsWorld, collisions_last: bool, bodies: &[RigidBodyHandle]) {
+    for _ in 0..3000 {
+        if collisions_last {
+            world.step_collisions_last();
+        } else {
+            world.step();
+        }
+        if bodies
+            .iter()
+            .all(|handle| world.bodies[*handle].is_sleeping())
+        {
+            return;
+        }
+    }
+    panic!("the bodies never fell asleep");
+}
+
+/// Wakes the top box of a sleeping stack between steps, in twin scenes stepped with stock `step`
+/// and with collisions-last. Falling asleep count-cleared the solver hints of the stack's pairs:
+/// stock stepping repairs them in the detection that precedes the solve, but collisions-last
+/// solves first. Unrepaired, the woken stack would be solved for one step without its resting
+/// contacts and sink under gravity, so no box may sink more than with stock stepping.
+fn check_wake_after_sleep(count: usize) {
+    let (mut stock, stock_boxes) = box_stack(count);
+    let (mut last, last_boxes) = box_stack(count);
+    step_until_asleep(&mut stock, false, &stock_boxes);
+    step_until_asleep(&mut last, true, &last_boxes);
+
+    let heights = |world: &PhysicsWorld, boxes: &[RigidBodyHandle]| -> Vec<Real> {
+        boxes
+            .iter()
+            .map(|handle| world.bodies[*handle].translation().y)
+            .collect()
+    };
+    let stock_rest = heights(&stock, &stock_boxes);
+    let last_rest = heights(&last, &last_boxes);
+
+    let (stock_top, last_top) = (*stock_boxes.last().unwrap(), *last_boxes.last().unwrap());
+    stock.wake_up(stock_top, true);
+    last.wake_up(last_top, true);
+    assert!(last_boxes.iter().all(|h| !last.bodies[*h].is_sleeping()));
+
+    for step in 0..10 {
+        stock.step();
+        last.step_collisions_last();
+        let stock_now = heights(&stock, &stock_boxes);
+        let last_now = heights(&last, &last_boxes);
+        for i in 0..count {
+            let stock_sink = stock_rest[i] - stock_now[i];
+            let last_sink = last_rest[i] - last_now[i];
+            assert!(
+                last_sink <= stock_sink + 1.0e-4,
+                "box {i} of {count} sank {last_sink} m with collisions-last but {stock_sink} m \
+                 with stock stepping, {} step(s) after the wake-up",
+                step + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn step_collisions_last_wake_after_sleep() {
+    check_wake_after_sleep(3);
+    check_wake_after_sleep(1);
+}

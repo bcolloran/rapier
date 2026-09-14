@@ -470,6 +470,17 @@ impl PhysicsPipeline {
             return;
         }
 
+        if mode == StepMode::CollisionsLast {
+            // Collisions-last solves before it detects collisions. Bodies woken since the last
+            // contact update (by the user between steps, or by a contact that started during
+            // that update) must be solved with the contacts they rested on: repair the solver
+            // hints their pairs lost when they fell asleep, which `Standard` gets from its
+            // detection before the solve.
+            self.counters.stages.collision_detection_time.resume();
+            narrow_phase.requalify_woken_pair_hints(islands, bodies, colliders);
+            self.counters.stages.collision_detection_time.pause();
+        }
+
         // The loop below overwrites its copy's `dt` with each substep's length; the
         // end-of-step detection of collisions-last uses the parameters of the whole step.
         let step_parameters = integration_parameters;

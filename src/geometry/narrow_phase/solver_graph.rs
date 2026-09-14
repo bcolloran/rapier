@@ -49,6 +49,70 @@ impl NarrowPhase {
         }
     }
 
+    /// Repairs the solver hints of the awake bodies' contact pairs that falling asleep
+    /// count-cleared, the same way the recycling branch of the contact update repairs them.
+    ///
+    /// [`PhysicsPipeline::step_collisions_last`](crate::pipeline::PhysicsPipeline::step_collisions_last)
+    /// solves before it detects collisions, so a body woken since the last contact update (by
+    /// the user between steps, or by a contact that started during that update) would otherwise
+    /// be solved for one step without the contacts it rested on. A pair that becomes
+    /// solver-selectable is added to `solver_graph_dirty` (kept sorted and deduplicated) so the
+    /// next maintenance reconciles its solver-graph and force-event membership.
+    ///
+    /// Deterministic (the dirty list is sorted) and idempotent (a repaired hint no longer has a
+    /// cleared count).
+    pub(crate) fn requalify_woken_pair_hints(
+        &mut self,
+        islands: &IslandManager,
+        bodies: &RigidBodySet,
+        colliders: &ColliderSet,
+    ) {
+        let dyn_awake = |handle: ColliderHandle| {
+            colliders
+                .get(handle)
+                .and_then(|co| co.parent.as_ref())
+                .and_then(|parent| bodies.get(parent.handle))
+                .is_some_and(|rb| rb.body_type.is_dynamic() && !rb.activation.sleeping)
+        };
+
+        let num_dirty = self.solver_graph_dirty.len();
+        for body_handle in islands.active_bodies() {
+            let Some(rb) = bodies.get(body_handle) else {
+                continue;
+            };
+            for co_handle in rb.colliders() {
+                let Some(gid) = self.graph_indices.get(co_handle.0) else {
+                    continue;
+                };
+                if !InteractionGraph::<ColliderHandle, ContactPair>::is_graph_index_valid(
+                    gid.contact_graph_index,
+                ) {
+                    continue;
+                }
+                for edge in self.contact_graph.graph.edges(gid.contact_graph_index) {
+                    let edge_id = edge.id().index();
+                    let Some(hint) = self.pair_solver_hints.get_mut(edge_id) else {
+                        continue;
+                    };
+                    if *hint & PAIR_HINT_COUNT_MASK != 0 {
+                        continue;
+                    }
+                    let pair = edge.weight();
+                    let is_dyn = dyn_awake(pair.collider1) || dyn_awake(pair.collider2);
+                    *hint = super::pair_qualified_manifold_count(pair)
+                        | ((is_dyn as u16) * PAIR_HINT_DYN_BIT);
+                    if *hint & PAIR_HINT_DYN_BIT != 0 && *hint & PAIR_HINT_COUNT_MASK != 0 {
+                        self.solver_graph_dirty.push(edge_id as u32);
+                    }
+                }
+            }
+        }
+        if self.solver_graph_dirty.len() != num_dirty {
+            self.solver_graph_dirty.sort_unstable();
+            self.solver_graph_dirty.dedup();
+        }
+    }
+
     /// Rebuilds [`Self::body_qualify_info`], the dense per-body table resolving
     /// `(is-dynamic-awake, solver-body index)` without fetching `RigidBody` structs. Low bit:
     /// `is_dynamic`; high 32: `active_set_id` (or frontier slot); `u64::MAX` = missing/fixed/kinematic.

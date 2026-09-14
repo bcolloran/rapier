@@ -31,7 +31,7 @@ const HOOKED_GOLDEN: u64 = 0x81bf_32df_72af_2aa3;
 /// when that mode was ported onto rapier 0.35.3. The digest also covers the initialization's
 /// events. Do not re-mint them to make an unrelated change pass.
 const MIXED_COLLISIONS_LAST_GOLDEN: u64 = 0x4775_892b_f8fb_3ba5;
-const HOOKED_COLLISIONS_LAST_GOLDEN: u64 = 0x7959_d7bb_5c1a_8e78;
+const HOOKED_COLLISIONS_LAST_GOLDEN: u64 = 0x227f_63a7_ada0_9894;
 
 const MIXED_STEPS: usize = 60;
 const HOOKED_STEPS: usize = 240;
