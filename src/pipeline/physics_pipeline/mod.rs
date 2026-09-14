@@ -64,6 +64,9 @@ pub struct PhysicsPipeline {
     /// Whether the initial collision detection of the collisions-last stepping mode already ran
     /// (see [`Self::initialize_collisions_last`]).
     collisions_last_initialized: bool,
+    /// Scratch: the contact adhesion budget pools of the current solve (see
+    /// `solve::apply_contact_adhesion`), cleared on every use.
+    adhesion_pools: solve::AdhesionPools,
     /// Scratch buffer holding the active body handles (parallel body update).
     #[cfg(feature = "parallel")]
     active_body_handles: Vec<crate::dynamics::RigidBodyHandle>,
@@ -126,6 +129,7 @@ impl PhysicsPipeline {
             end_step_collider_aabbs: vec![],
             quarantine: Quarantine::default(),
             collisions_last_initialized: false,
+            adhesion_pools: Vec::new(),
         }
     }
 

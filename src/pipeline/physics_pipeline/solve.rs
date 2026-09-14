@@ -3,12 +3,15 @@
 
 use crate::alloc_prelude::*;
 
+use crate::dynamics::solver::manifold_store::ManifoldStore;
+use crate::dynamics::solver::solver_contact_graph::SolverContactGraph;
 use crate::dynamics::{
     ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet, RigidBodySet,
 };
-use crate::geometry::{BroadPhaseBvh, ColliderHandle, ColliderSet, NarrowPhase};
+use crate::geometry::{BroadPhaseBvh, ColliderHandle, ColliderSet, NEW_CONTACT_BIT, NarrowPhase};
 use crate::math::{Real, Vector};
 use crate::pipeline::{EventHandler, PhysicsHooks};
+use crate::utils::CrossProduct;
 
 use super::PhysicsPipeline;
 
@@ -370,6 +373,15 @@ impl PhysicsPipeline {
             #[cfg(not(feature = "parallel"))]
             let num_threads = 1;
 
+            // Contact adhesion requested by the hooks: added to the effective forces the fused
+            // traversal assigned above, right before the solver reads them.
+            apply_contact_adhesion(
+                &mut self.adhesion_pools,
+                narrow_phase.solver_graph(),
+                &manifold_store,
+                bodies,
+            );
+
             let joint_assembly_epoch = impulse_joints.assembly_epoch;
             self.staged_solver.init_and_solve(
                 num_threads,
@@ -398,5 +410,140 @@ impl PhysicsPipeline {
         );
 
         self.counters.stages.solver_time.pause();
+    }
+}
+
+/// Weight floor for adhesion budget distribution: keeps point contacts (zero tangential extent)
+/// in their pool — a lone point contact receives the full budget, while a degenerate sliver
+/// manifold alongside real area contacts receives almost nothing.
+const ADHESION_BUDGET_MIN_WEIGHT: Real = 1.0e-3;
+
+/// Scratch adhesion budget pools: `((owner, channel), (pool total, sum of member weights))`.
+pub(super) type AdhesionPools = Vec<((ColliderHandle, u32), (Real, Real))>;
+
+/// Applies the adhesion requested through `PhysicsHooks::modify_solver_contacts` (stored on each
+/// manifold by the narrow phase) as external forces on the bodies, right before the contact
+/// solver reads them ("Design A": the unchanged push-only contacts then produce the holding
+/// reaction, the break threshold and friction).
+///
+/// Must run after the fused traversal assigned the effective forces, so nothing accumulates.
+/// A body woken by `update_islands`' first-step bootstrap after a legacy-snapshot restore missed
+/// that traversal; its effective force is stale this step, adhesion included.
+///
+/// Visits exactly the solver-active manifolds — the solver contact graph's color buckets in
+/// ascending color order, then the generic (multibody) list, resolved through the manifold store
+/// (so 3D clusters, not their plain manifolds) — in an order that is identical in serial and
+/// parallel builds and survives snapshots. Serial; the first pass builds the budget pools and
+/// returns early when nothing requests adhesion.
+///
+/// For each manifold with `k` solver contacts, the magnitude
+/// `F = max(force, 0) + max(pressure, 0) · extent + pool_total · weight / pool_weight_sum`
+/// is split into `k` equal forces `f = normal · F / k`, one per solver contact: `+f` on the
+/// first body and `-f` on the second (the normal points from collider1 toward collider2, so
+/// this pulls them together), each with the torque of the solver's own frozen lever arm
+/// (`ContactData::solver_dp1`/`solver_dp2`).
+///
+/// Only awake dynamic bodies are pulled, and never a side the solver treats as world-attached
+/// through dominance (`relative_dominance > 0` for the first body, `< 0` for the second, the
+/// convention of the narrow-phase localization and the constraint builders): that side gets no
+/// contact reaction, so pulling it would drag the dominant body through the contact.
+fn apply_contact_adhesion(
+    pools: &mut AdhesionPools,
+    graph: &SolverContactGraph,
+    store: &ManifoldStore,
+    bodies: &mut RigidBodySet,
+) {
+    let refs = || {
+        graph
+            .buckets()
+            .flat_map(|(_, refs)| refs.iter())
+            .chain(graph.generic().iter())
+            .filter(|r| !r.is_padding())
+    };
+
+    pools.clear();
+    let mut any_request = false;
+    for r in refs() {
+        let data = &store.get(*r).data;
+        if data.solver_contacts.is_empty() {
+            continue;
+        }
+        any_request |= data.adhesion_force > 0.0 || data.adhesion_pressure > 0.0;
+        if let Some(budget) = &data.adhesion_budget {
+            if budget.total > 0.0 {
+                any_request = true;
+                let key = (budget.owner, budget.channel);
+                let weight = data.adhesion_extent.max(ADHESION_BUDGET_MIN_WEIGHT);
+                match pools.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, (total, weight_sum))) => {
+                        *total = total.max(budget.total);
+                        *weight_sum += weight;
+                    }
+                    None => pools.push((key, (budget.total, weight))),
+                }
+            }
+        }
+    }
+    if !any_request {
+        return;
+    }
+
+    for r in refs() {
+        let manifold = store.get(*r);
+        let data = &manifold.data;
+        let num_contacts = data.solver_contacts.len();
+        if num_contacts == 0 {
+            continue;
+        }
+
+        let mut magnitude = data.adhesion_force.max(0.0);
+        let pressure = data.adhesion_pressure.max(0.0);
+        if pressure > 0.0 {
+            magnitude += pressure * data.adhesion_extent;
+        }
+        if let Some(budget) = &data.adhesion_budget {
+            if budget.total > 0.0 {
+                let key = (budget.owner, budget.channel);
+                if let Some((_, (total, weight_sum))) = pools.iter().find(|(k, _)| *k == key) {
+                    let weight = data.adhesion_extent.max(ADHESION_BUDGET_MIN_WEIGHT);
+                    // This manifold's share; the shares of a pool sum to its total.
+                    magnitude += (*total / *weight_sum) * weight;
+                }
+            }
+        }
+        // Nothing requested (or a non-finite product): write nothing, so stock results stay
+        // bit-identical.
+        if magnitude.is_nan() || magnitude <= 0.0 {
+            continue;
+        }
+
+        let per_contact = data.normal * (magnitude / num_contacts as Real);
+        let rel_dom = data.relative_dominance;
+        for (handle, world_attached, first) in [
+            (data.rigid_body1, rel_dom > 0, true),
+            (data.rigid_body2, rel_dom < 0, false),
+        ] {
+            if world_attached {
+                continue;
+            }
+            let Some(rb) = handle.and_then(|h| bodies.get_mut_internal(h)) else {
+                continue;
+            };
+            if !rb.is_dynamic() || rb.is_sleeping() {
+                continue;
+            }
+            let force = if first { per_contact } else { -per_contact };
+            for contact in &data.solver_contacts {
+                let cid = (contact.contact_id[0] & !NEW_CONTACT_BIT) as usize;
+                let point = &manifold.points[cid].data;
+                let arm = if first {
+                    point.solver_dp1
+                } else {
+                    point.solver_dp2
+                };
+                rb.forces.force += force;
+                rb.forces.torque += arm.gcross(force);
+            }
+        }
     }
 }
