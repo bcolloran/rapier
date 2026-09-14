@@ -263,6 +263,43 @@ impl PhysicsPipeline {
         }
     }
 
+    /// Ends a collision detection that collisions-last runs outside of a solve: the end-of-step
+    /// detection of [`StepMode::CollisionsLast`] and the detection of
+    /// [`StepMode::CollisionsLastInit`]. What it leaves behind must not depend on whether a
+    /// snapshot is taken and restored before the next step:
+    /// - It reconciles the solver contact graph with the pairs the detection changed now, instead
+    ///   of at the next solve. The narrow-phase keeps that pending list only until its next
+    ///   contact update (which replaces it) and doesn't serialize it. The maintenance only needs a
+    ///   consistent active set, which the wake-ups of the detection keep (they bump the island
+    ///   epoch, forcing a rebuild).
+    /// - It then drops the list, so an uninterrupted and a restored world reach the next solve
+    ///   with the same, empty list. Nothing needs the list before that solve: a catch-up
+    ///   detection replaces it, and `NarrowPhase::requalify_woken_pair_hints` appends to it.
+    /// - It joins the deferred BVH optimization the detection may have started, so scene queries
+    ///   and snapshots between steps see the whole broad-phase.
+    fn finish_collisions_last_detection(
+        &mut self,
+        islands: &IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &RigidBodySet,
+        colliders: &ColliderSet,
+        multibody_joints: &MultibodyJointSet,
+    ) {
+        self.counters
+            .stages
+            .island_constraints_collection_time
+            .resume();
+        narrow_phase.maintain_solver_contact_graph(islands, bodies, colliders, multibody_joints);
+        narrow_phase.clear_solver_graph_dirty();
+        self.counters
+            .stages
+            .island_constraints_collection_time
+            .pause();
+
+        self.join_deferred_bvh_optimize(broad_phase);
+    }
+
     fn interpolate_kinematic_velocities(
         &mut self,
         integration_parameters: &IntegrationParameters,
@@ -462,9 +499,18 @@ impl PhysicsPipeline {
         }
 
         if mode == StepMode::CollisionsLastInit {
-            // No solve: hand the tree back so queries between the initialization and the
-            // first step see the whole broad-phase.
-            self.join_deferred_bvh_optimize(broad_phase);
+            // No solve: end the detection the way a collisions-last step ends its end-of-step
+            // detection. The graph may already be valid (a world first stepped with `step`), so
+            // a pending maintenance left here would be lost by a snapshot taken right after
+            // the initialization.
+            self.finish_collisions_last_detection(
+                islands,
+                broad_phase,
+                narrow_phase,
+                bodies,
+                colliders,
+                multibody_joints,
+            );
             colliders.set_modified(modified_colliders);
             self.counters.step_completed();
             return;
@@ -681,36 +727,22 @@ impl PhysicsPipeline {
                 false,
             );
 
-            // Reconcile the solver contact graph with the pairs this detection changed now,
-            // instead of at the next solve. The narrow-phase keeps that pending list only until
-            // its next contact update (which replaces it) and doesn't serialize it, so a
-            // catch-up detection at the start of the next step, or a snapshot taken between
-            // steps, would lose it. The maintenance only needs a consistent active set, which
-            // the wake-ups of the detection keep (they bump the island epoch, forcing a
-            // rebuild). Re-running it at the next solve is idempotent.
-            self.counters
-                .stages
-                .island_constraints_collection_time
-                .resume();
-            narrow_phase.maintain_solver_contact_graph(
-                islands,
-                bodies,
-                colliders,
-                multibody_joints,
-            );
-            self.counters
-                .stages
-                .island_constraints_collection_time
-                .pause();
-
             self.counters.stages.user_changes.resume();
             self.clear_modified_colliders(colliders, &mut modified_colliders);
             removed_colliders.clear();
             self.counters.stages.user_changes.pause();
 
-            // The detection may have moved the tree into a deferred optimization: put it back,
-            // or scene queries and snapshots between steps would see an empty broad-phase.
-            self.join_deferred_bvh_optimize(broad_phase);
+            // Reconcile the solver graph now and drop the pending list (a catch-up detection at
+            // the start of the next step, or a snapshot taken between steps, would lose it), and
+            // hand the tree back to the broad-phase.
+            self.finish_collisions_last_detection(
+                islands,
+                broad_phase,
+                narrow_phase,
+                bodies,
+                colliders,
+                multibody_joints,
+            );
         }
 
         // Re-insert the modified vector we extracted for the borrow-checker.

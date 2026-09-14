@@ -1162,6 +1162,282 @@ fn step_collisions_last_snapshot_roundtrip() {
     check_snapshot_roundtrip_after_contact_start(80);
 }
 
+/// Collision and contact-force events in emission order, as `(kind, collider1 index, collider2
+/// index, force magnitude bits)`, with kind 0 = started, 1 = stopped, 2 = contact force (the
+/// magnitude is 0 for collision events).
+#[cfg(feature = "serde-serialize")]
+#[derive(Default)]
+struct EventOrderLog(std::sync::Mutex<Vec<(u8, u32, u32, u64)>>);
+
+#[cfg(feature = "serde-serialize")]
+impl EventOrderLog {
+    /// The events recorded since the last call.
+    fn take(&self) -> Vec<(u8, u32, u32, u64)> {
+        core::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+#[cfg(feature = "serde-serialize")]
+impl EventHandler for EventOrderLog {
+    fn handle_collision_event(
+        &self,
+        _: &RigidBodySet,
+        _: &ColliderSet,
+        event: CollisionEvent,
+        _: Option<&ContactPair>,
+    ) {
+        let (kind, h1, h2) = match event {
+            CollisionEvent::Started(h1, h2, _) => (0, h1, h2),
+            CollisionEvent::Stopped(h1, h2, _) => (1, h1, h2),
+        };
+        self.0
+            .lock()
+            .unwrap()
+            .push((kind, h1.into_raw_parts().0, h2.into_raw_parts().0, 0));
+    }
+
+    fn handle_contact_force_event(
+        &self,
+        _: Real,
+        _: &RigidBodySet,
+        _: &ColliderSet,
+        pair: &ContactPair,
+        total_force_magnitude: Real,
+    ) {
+        self.0.lock().unwrap().push((
+            2,
+            pair.collider1.into_raw_parts().0,
+            pair.collider2.into_raw_parts().0,
+            (total_force_magnitude as f64).to_bits(),
+        ));
+    }
+}
+
+/// A contact-modification hook that writes the friction of every manifold it sees and counts
+/// its calls, like the game's hook writes its own contact parameters.
+#[cfg(feature = "serde-serialize")]
+#[derive(Default)]
+struct FrictionHook(core::sync::atomic::AtomicUsize);
+
+#[cfg(feature = "serde-serialize")]
+impl FrictionHook {
+    fn take(&self) -> usize {
+        self.0.swap(0, core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "serde-serialize")]
+impl PhysicsHooks for FrictionHook {
+    fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        *context.friction = 0.3;
+    }
+}
+
+/// Steps `world` and `restored` (a bincode snapshot of it) side by side for `steps` steps, with
+/// `step` or with `step_collisions_last`, each with its own [`FrictionHook`] and
+/// [`EventOrderLog`]. After every step, the two worlds must have emitted the same events in the
+/// same order, called the hook as often, and serialize to the same bytes. Returns the number of
+/// contact-force events emitted, so callers can check their scene exercised them.
+#[cfg(feature = "serde-serialize")]
+fn assert_restored_twin_matches(
+    world: &mut PhysicsWorld,
+    restored: &mut PhysicsWorld,
+    collisions_last: bool,
+    steps: usize,
+    what: &str,
+) -> usize {
+    let (log, restored_log) = (EventOrderLog::default(), EventOrderLog::default());
+    let (hooks, restored_hooks) = (FrictionHook::default(), FrictionHook::default());
+    let mut force_events = 0;
+    for i in 0..steps {
+        if collisions_last {
+            world.step_collisions_last_with_events(&hooks, &log);
+            restored.step_collisions_last_with_events(&restored_hooks, &restored_log);
+        } else {
+            world.step_with_events(&hooks, &log);
+            restored.step_with_events(&restored_hooks, &restored_log);
+        }
+        let (events, restored_events) = (log.take(), restored_log.take());
+        force_events += events.iter().filter(|event| event.0 == 2).count();
+        assert_eq!(
+            events,
+            restored_events,
+            "{what}: the uninterrupted world (left) and the restored world (right) emitted \
+             different events {} step(s) after the restore",
+            i + 1
+        );
+        assert_eq!(
+            hooks.take(),
+            restored_hooks.take(),
+            "{what}: the contact hook ran a different number of times {} step(s) after the restore",
+            i + 1
+        );
+        assert!(
+            bincode::serialize(world).unwrap() == bincode::serialize(restored).unwrap(),
+            "{what}: the restored world's bytes diverged {} step(s) after the restore",
+            i + 1
+        );
+    }
+    force_events
+}
+
+/// Saves a world right after both contacts of a box start in the same detection, then enables
+/// contact-force events on the box in the uninterrupted and the restored world, and steps both
+/// with `step_collisions_last` (or with `step`, the control).
+///
+/// The box falls flat onto the seam of two abutting fixed tiles (one of them hooked), so both
+/// pairs change solver-graph membership in the same detection. In collisions-last mode that is
+/// the end-of-step detection, whose maintenance used to leave the narrow-phase's pending list of
+/// changed pairs filled. The list is not serialized, so only the uninterrupted world still held it
+/// at the next solve. Enabling force events is a deferrable change (no catch-up detection), and it
+/// flags both pairs for force-event reconciliation, which walked the stale list (ascending edge
+/// ids) before the flagged pairs (graph adjacency order): the two worlds ordered their force-event
+/// pairs differently, so their bytes differed and their force events came out in a different
+/// order. Stock stepping's detection always replaces the list before its solve.
+#[cfg(feature = "serde-serialize")]
+fn check_restore_keeps_force_event_order(collisions_last: bool) {
+    let what = if collisions_last {
+        "collisions-last seam landing"
+    } else {
+        "stock seam landing (control)"
+    };
+    let mut world = PhysicsWorld::new();
+    let tile1 = world.insert_collider(cuboid(1.0, 0.1).translation(v(-1.0, 0.0)), None);
+    let tile2 = world.insert_collider(
+        cuboid(1.0, 0.1)
+            .translation(v(1.0, 0.0))
+            .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+        None,
+    );
+    let (_, box_co) = world.insert(
+        RigidBodyBuilder::dynamic().translation(v(0.0, 1.0)),
+        cuboid(0.5, 0.5).active_events(ActiveEvents::COLLISION_EVENTS),
+    );
+    let touching = |world: &PhysicsWorld, tile: ColliderHandle| {
+        world
+            .contact_pair(tile, box_co)
+            .is_some_and(|pair| pair.has_any_active_contact())
+    };
+
+    let (hooks, log) = (FrictionHook::default(), EventOrderLog::default());
+    let mut steps = 0;
+    loop {
+        if collisions_last {
+            world.step_collisions_last_with_events(&hooks, &log);
+        } else {
+            world.step_with_events(&hooks, &log);
+        }
+        steps += 1;
+        let (on1, on2) = (touching(&world, tile1), touching(&world, tile2));
+        if on1 || on2 {
+            assert!(
+                on1 && on2,
+                "{what}: the box's two contacts did not start in the same step"
+            );
+            break;
+        }
+        assert!(steps < 500, "{what}: the box never landed");
+    }
+
+    let snapshot = bincode::serialize(&world).unwrap();
+    let mut restored: PhysicsWorld = bincode::deserialize(&snapshot).unwrap();
+    if collisions_last {
+        restored
+            .physics_pipeline
+            .set_collisions_last_initialized(true);
+    }
+
+    // Changes only the event flags: the collider is marked modified, with no other change.
+    let events = ActiveEvents::COLLISION_EVENTS | ActiveEvents::CONTACT_FORCE_EVENTS;
+    world.colliders[box_co].set_active_events(events);
+    restored.colliders[box_co].set_active_events(events);
+
+    let force_events = assert_restored_twin_matches(
+        &mut world,
+        &mut restored,
+        collisions_last,
+        30,
+        &alloc::format!("{what} (saved after step {steps})"),
+    );
+    assert!(
+        force_events > 0,
+        "{what}: the scene emitted no contact-force events"
+    );
+}
+
+#[cfg(feature = "serde-serialize")]
+#[test]
+fn step_collisions_last_snapshot_restore_keeps_force_event_order() {
+    check_restore_keeps_force_event_order(true);
+    check_restore_keeps_force_event_order(false);
+}
+
+/// `initialize_collisions_last` on a world first stepped with `step`, whose solver contact graph
+/// is therefore already valid. The initialization ends with a detection, which here starts a
+/// contact, so it leaves a pending solver-graph maintenance behind unless it ends the way a
+/// collisions-last step does. A snapshot taken right after the initialization must restore into a
+/// world that steps on bit-identically, with the same events.
+#[cfg(feature = "serde-serialize")]
+#[test]
+fn initialize_collisions_last_after_stock_steps_snapshot_roundtrip() {
+    let events = ActiveEvents::COLLISION_EVENTS | ActiveEvents::CONTACT_FORCE_EVENTS;
+    let make = || {
+        let (mut world, _, ball_co, floor_co) = ball_on_floor(0.0);
+        world.colliders[ball_co].set_active_events(events);
+        world.colliders[floor_co].set_active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS);
+        (world, ball_co, floor_co)
+    };
+    let touching = |world: &PhysicsWorld, ball_co: ColliderHandle, floor_co: ColliderHandle| {
+        world
+            .contact_pair(ball_co, floor_co)
+            .is_some_and(|pair| pair.has_any_active_contact())
+    };
+    let hooks = FrictionHook::default();
+
+    // The stock step whose detection (at the start of the step) starts the contact.
+    let (mut probe, ball_co, floor_co) = make();
+    let mut contact_step = 0;
+    while !touching(&probe, ball_co, floor_co) {
+        probe.step_with_events(&hooks, &());
+        contact_step += 1;
+        assert!(contact_step < 200, "the ball never touched the floor");
+    }
+
+    // One stock step fewer: the detection of the initialization starts the contact instead.
+    let (mut world, ..) = make();
+    for _ in 1..contact_step {
+        world.step_with_events(&hooks, &());
+    }
+    assert!(!touching(&world, ball_co, floor_co));
+    world
+        .physics_pipeline
+        .set_collisions_last_initialized(false);
+    world.initialize_collisions_last_with_events(&hooks, &());
+    assert!(
+        touching(&world, ball_co, floor_co),
+        "the initialization's detection should start the contact"
+    );
+
+    let snapshot = bincode::serialize(&world).unwrap();
+    let mut restored: PhysicsWorld = bincode::deserialize(&snapshot).unwrap();
+    restored
+        .physics_pipeline
+        .set_collisions_last_initialized(true);
+
+    let force_events = assert_restored_twin_matches(
+        &mut world,
+        &mut restored,
+        true,
+        60,
+        &alloc::format!("initialization after {} stock steps", contact_step - 1),
+    );
+    assert!(
+        force_events > 0,
+        "the scene emitted no contact-force events"
+    );
+}
+
 /// A stack of `count` boxes resting on a fixed floor whose top is at `y = 0.1`, bottom box first.
 fn box_stack(count: usize) -> (PhysicsWorld, Vec<RigidBodyHandle>) {
     let mut world = PhysicsWorld::new();

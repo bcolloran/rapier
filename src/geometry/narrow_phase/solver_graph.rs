@@ -113,6 +113,19 @@ impl NarrowPhase {
         }
     }
 
+    /// Drops the pending list of pairs whose solver-graph membership may have changed, once
+    /// [`Self::maintain_solver_contact_graph`] has reconciled them.
+    ///
+    /// The list is not serialized. Collisions-last maintains the graph at the end of each step and
+    /// of its initialization, where a snapshot can be taken, so it must leave the list empty
+    /// there: otherwise the next solve of the uninterrupted world walks pairs the restored world
+    /// doesn't have, and the order-sensitive force-event reconciliation can order its pairs
+    /// differently. Stock stepping doesn't need this: its contact update replaces the list before
+    /// every solve.
+    pub(crate) fn clear_solver_graph_dirty(&mut self) {
+        self.solver_graph_dirty.clear();
+    }
+
     /// Rebuilds [`Self::body_qualify_info`], the dense per-body table resolving
     /// `(is-dynamic-awake, solver-body index)` without fetching `RigidBody` structs. Low bit:
     /// `is_dynamic`; high 32: `active_set_id` (or frontier slot); `u64::MAX` = missing/fixed/kinematic.
@@ -360,7 +373,8 @@ impl NarrowPhase {
             self.solver_graph_valid = true;
             // `solver_graph_dirty` is intentionally NOT cleared: the force-event reconcile
             // below still needs this step's dirty edges, and the next contact update
-            // clears the list at its start anyway.
+            // clears the list at its start anyway (collisions-last, which maintains the graph
+            // between steps, clears it with `clear_solver_graph_dirty`).
         } else {
             let dirty = core::mem::take(&mut self.solver_graph_dirty);
             for &edge in &dirty {
