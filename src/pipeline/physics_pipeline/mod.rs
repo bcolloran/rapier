@@ -18,8 +18,11 @@ mod quarantine;
 pub use quarantine::Quarantine;
 mod solve;
 mod substep;
+use substep::StepMode;
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_collisions_last;
 #[cfg(test)]
 mod test_staged;
 
@@ -58,6 +61,9 @@ pub struct PhysicsPipeline {
     end_step_collider_aabbs: Vec<(ColliderHandle, crate::geometry::Aabb)>,
     /// Non-finite state detected and neutralized during the last step.
     quarantine: Quarantine,
+    /// Whether the initial collision detection of the collisions-last stepping mode already ran
+    /// (see [`Self::initialize_collisions_last`]).
+    collisions_last_initialized: bool,
     /// Scratch buffer holding the active body handles (parallel body update).
     #[cfg(feature = "parallel")]
     active_body_handles: Vec<crate::dynamics::RigidBodyHandle>,
@@ -119,6 +125,7 @@ impl PhysicsPipeline {
             broad_phase_events: vec![],
             end_step_collider_aabbs: vec![],
             quarantine: Quarantine::default(),
+            collisions_last_initialized: false,
         }
     }
 
@@ -213,6 +220,7 @@ impl PhysicsPipeline {
         if let Some(pool) = self.thread_pool.clone() {
             return pool.install(|| {
                 self.step_inner(
+                    StepMode::Standard,
                     gravity,
                     integration_parameters,
                     islands,
@@ -230,6 +238,7 @@ impl PhysicsPipeline {
         }
 
         self.step_inner(
+            StepMode::Standard,
             gravity,
             integration_parameters,
             islands,
@@ -243,6 +252,256 @@ impl PhysicsPipeline {
             hooks,
             events,
         )
+    }
+
+    /// Advances the simulation by one timestep, with collision detection at the end.
+    ///
+    /// Unlike [`step`](Self::step), which detects collisions first and then integrates, this
+    /// method integrates first and then detects collisions. The contact and intersection data
+    /// of the narrow-phase is therefore up to date with the body positions when the method
+    /// returns, so the caller can read accurate collision information (for example with
+    /// [`NarrowPhase::contact_pairs_with`]) between steps. The solve uses the contacts detected
+    /// at the end of the previous call.
+    ///
+    /// On the first call, the initial collision detection is run automatically (the same as
+    /// calling [`initialize_collisions_last`](Self::initialize_collisions_last)). Call that
+    /// method yourself if you need to read collision data at t=0, before the first step.
+    ///
+    /// This method has the same signature as [`step`](Self::step) and can be used as a drop-in
+    /// replacement. Use one or the other for a given simulation, not both.
+    ///
+    /// # User changes between steps
+    ///
+    /// Changes made to colliders and bodies between steps are applied to the narrow-phase before
+    /// the solve: removed colliders lose their contact pairs, and the pairs of modified colliders
+    /// are woken and recolored. Their contacts are only recomputed at the end of the step, except
+    /// when a change invalidates the contacts the solve would use. On steps where a collider is
+    /// inserted, re-parented, enabled or disabled, or changes its shape, collision groups or
+    /// sensor status, or its parent body changes type or dominance, a full collision detection
+    /// (a catch-up) also runs before the solve:
+    ///
+    /// - Inserted colliders get their contacts before that step's solve (instead of one step
+    ///   later).
+    /// - Collision detection runs twice on those steps, so the physics hooks may be called twice
+    ///   for the same pair. Collision events are only emitted when a pair starts or stops
+    ///   touching, so they are not duplicated: a contact that starts during the catch-up is not
+    ///   reported again by the end-of-step detection.
+    ///
+    /// A position-only change (for example a teleport) or a collider removal does not trigger
+    /// the catch-up: that step's solve uses the contacts detected at the previous poses, and the
+    /// broad-phase only sees the change at the end of the step.
+    ///
+    /// # Snapshots
+    ///
+    /// The pipeline is not part of a snapshot. When stepping a restored snapshot with a pipeline
+    /// that has not been initialized yet (for example a fresh one), call
+    /// [`set_collisions_last_initialized(true)`](Self::set_collisions_last_initialized) before
+    /// the first call to this method. Otherwise the initial collision detection runs again,
+    /// which modifies the restored broad-phase and narrow-phase.
+    pub fn step_collisions_last(
+        &mut self,
+        gravity: Vector,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        // With a dedicated pool configured, run the whole step inside it.
+        #[cfg(all(feature = "parallel", not(feature = "unsync-callbacks")))]
+        if let Some(pool) = self.thread_pool.clone() {
+            return pool.install(|| {
+                self.step_collisions_last_inner(
+                    gravity,
+                    integration_parameters,
+                    islands,
+                    broad_phase,
+                    narrow_phase,
+                    bodies,
+                    colliders,
+                    impulse_joints,
+                    multibody_joints,
+                    ccd_solver,
+                    hooks,
+                    events,
+                )
+            });
+        }
+
+        self.step_collisions_last_inner(
+            gravity,
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            ccd_solver,
+            hooks,
+            events,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_collisions_last_inner(
+        &mut self,
+        gravity: Vector,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        if !self.collisions_last_initialized {
+            self.collisions_last_initialized = true;
+            self.step_inner(
+                StepMode::CollisionsLastInit,
+                gravity,
+                integration_parameters,
+                islands,
+                broad_phase,
+                narrow_phase,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                ccd_solver,
+                hooks,
+                events,
+            );
+        }
+
+        self.step_inner(
+            StepMode::CollisionsLast,
+            gravity,
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            ccd_solver,
+            hooks,
+            events,
+        )
+    }
+
+    /// Runs the initial collision detection of the collisions-last stepping mode
+    /// ([`step_collisions_last`](Self::step_collisions_last)).
+    ///
+    /// It applies the pending user changes and detects collisions at the current body
+    /// positions, without moving anything. Afterwards the narrow-phase holds the contact and
+    /// intersection data at t=0, which you can read before the first step. Physics hooks and
+    /// collision events run as they would during a step.
+    ///
+    /// [`step_collisions_last`](Self::step_collisions_last) calls this automatically on its
+    /// first call, so you only need it to read collision data before stepping. It runs once:
+    /// calling it again, or after the first `step_collisions_last`, does nothing (see
+    /// [`collisions_last_initialized`](Self::collisions_last_initialized)).
+    ///
+    /// `ccd_solver` is needed because the user changes applied here (for example inserted or
+    /// removed fixed colliders) must invalidate its cached list of fixed targets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_collisions_last(
+        &mut self,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        if self.collisions_last_initialized {
+            return;
+        }
+        self.collisions_last_initialized = true;
+
+        // Gravity is only used by the solve, which the initialization doesn't run.
+        let gravity = Vector::ZERO;
+
+        // With a dedicated pool configured, run the detection inside it, like a step.
+        #[cfg(all(feature = "parallel", not(feature = "unsync-callbacks")))]
+        if let Some(pool) = self.thread_pool.clone() {
+            return pool.install(|| {
+                self.step_inner(
+                    StepMode::CollisionsLastInit,
+                    gravity,
+                    integration_parameters,
+                    islands,
+                    broad_phase,
+                    narrow_phase,
+                    bodies,
+                    colliders,
+                    impulse_joints,
+                    multibody_joints,
+                    ccd_solver,
+                    hooks,
+                    events,
+                )
+            });
+        }
+
+        self.step_inner(
+            StepMode::CollisionsLastInit,
+            gravity,
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            ccd_solver,
+            hooks,
+            events,
+        )
+    }
+
+    /// Whether the initial collision detection of the collisions-last stepping mode already ran
+    /// on this pipeline, either through
+    /// [`initialize_collisions_last`](Self::initialize_collisions_last) or through the first
+    /// call to [`step_collisions_last`](Self::step_collisions_last).
+    pub fn collisions_last_initialized(&self) -> bool {
+        self.collisions_last_initialized
+    }
+
+    /// Sets whether the initial collision detection of the collisions-last stepping mode already
+    /// ran, without running it.
+    ///
+    /// The flag lives in the pipeline, which is not part of a snapshot. A restored broad-phase
+    /// and narrow-phase already hold the collision data of the step they were saved after, so
+    /// before stepping them with [`step_collisions_last`](Self::step_collisions_last) on a
+    /// pipeline that was not initialized (for example a fresh one), set this to `true`.
+    /// Re-running the initialization instead would detect collisions again and change the
+    /// restored broad-phase and narrow-phase, so the simulation would diverge from the run the
+    /// snapshot was taken from.
+    ///
+    /// Setting it to `false` makes the next `step_collisions_last` (or
+    /// `initialize_collisions_last`) run the initialization again.
+    pub fn set_collisions_last_initialized(&mut self, initialized: bool) {
+        self.collisions_last_initialized = initialized;
     }
 }
 

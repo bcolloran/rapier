@@ -26,6 +26,13 @@ use rapier2d::prelude::*;
 const MIXED_GOLDEN: u64 = 0xa9f4_44db_810d_922d;
 const HOOKED_GOLDEN: u64 = 0x81bf_32df_72af_2aa3;
 
+/// FNV-1a digests of the same scenes stepped with collisions-last
+/// (`initialize_collisions_last_with_events`, then `step_collisions_last_with_events`), minted
+/// when that mode was ported onto rapier 0.35.3. The digest also covers the initialization's
+/// events. Do not re-mint them to make an unrelated change pass.
+const MIXED_COLLISIONS_LAST_GOLDEN: u64 = 0x4775_892b_f8fb_3ba5;
+const HOOKED_COLLISIONS_LAST_GOLDEN: u64 = 0x7959_d7bb_5c1a_8e78;
+
 const MIXED_STEPS: usize = 60;
 const HOOKED_STEPS: usize = 240;
 
@@ -324,4 +331,67 @@ fn hooked_scene_matches_fork_golden() {
         "hooked_scene is missing collision or contact-force events: {counts:?}"
     );
     check("hooked_scene", fnv.0, HOOKED_GOLDEN);
+}
+
+fn check_collisions_last(name: &str, got: u64, golden: u64) {
+    assert_eq!(
+        got, golden,
+        "\n{name}: collisions-last simulation results differ from the fork golden.\n  \
+         golden: {golden:#018x}\n  got:    {got:#018x}\nA change altered \
+         `step_collisions_last` behavior. Do not re-mint this golden to make an unrelated \
+         change pass.\n",
+    );
+}
+
+#[test]
+fn mixed_scene_collisions_last_matches_fork_golden() {
+    let mut world = mixed_scene();
+    let log = EventLog::default();
+    let mut fnv = Fnv::new();
+    let mut counts = [0; 4];
+    world.initialize_collisions_last_with_events(&(), &log);
+    log.digest_step(&mut fnv, &mut counts);
+    for _ in 0..MIXED_STEPS {
+        world.step_collisions_last_with_events(&(), &log);
+        log.digest_step(&mut fnv, &mut counts);
+    }
+    digest_world(&world, &mut fnv);
+    assert!(
+        counts[0] > 0,
+        "mixed_scene (collisions-last) produced no collision events: {counts:?}"
+    );
+    check_collisions_last(
+        "mixed_scene_collisions_last",
+        fnv.0,
+        MIXED_COLLISIONS_LAST_GOLDEN,
+    );
+}
+
+#[test]
+fn hooked_scene_collisions_last_matches_fork_golden() {
+    let (mut world, hooks) = hooked_scene();
+    let log = EventLog::default();
+    let mut fnv = Fnv::new();
+    let mut counts = [0; 4];
+    world.initialize_collisions_last_with_events(&hooks, &log);
+    log.digest_step(&mut fnv, &mut counts);
+    for _ in 0..HOOKED_STEPS {
+        world.step_collisions_last_with_events(&hooks, &log);
+        log.digest_step(&mut fnv, &mut counts);
+    }
+    digest_world(&world, &mut fnv);
+    let calls = hooks.calls.load(Ordering::Relaxed);
+    assert!(
+        calls > 0,
+        "hooked_scene (collisions-last) never ran its contact hook"
+    );
+    assert!(
+        counts[0] > 0 && counts[2] > 0 && counts[3] > 0,
+        "hooked_scene (collisions-last) is missing collision or contact-force events: {counts:?}"
+    );
+    check_collisions_last(
+        "hooked_scene_collisions_last",
+        fnv.0,
+        HOOKED_COLLISIONS_LAST_GOLDEN,
+    );
 }

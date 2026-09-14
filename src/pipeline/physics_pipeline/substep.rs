@@ -18,6 +18,32 @@ use crate::prelude::ModifiedRigidBodies;
 
 use super::PhysicsPipeline;
 
+/// Where [`PhysicsPipeline::step_inner`] runs collision detection relative to the solve.
+///
+/// One code path serves every mode, so upstream changes to the step apply to all of them. In
+/// `Standard` mode every mode-specific branch does nothing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum StepMode {
+    /// [`PhysicsPipeline::step`]: detect collisions at the start-of-step poses, then solve and
+    /// integrate.
+    Standard,
+    /// [`PhysicsPipeline::initialize_collisions_last`]: apply the user changes and detect
+    /// collisions at the current poses, then stop before the solve.
+    CollisionsLastInit,
+    /// [`PhysicsPipeline::step_collisions_last`]: solve and integrate with the contacts detected
+    /// at the end of the previous call, then detect collisions at the end-of-step poses.
+    CollisionsLast,
+}
+
+/// Collider changes a collisions-last step leaves to its end-of-step detection. It is the set
+/// the narrow-phase accepts when recycling a pair's contacts (see `process_pair`): those changes
+/// keep the stored contacts usable for a solve. Any other change (inserted, re-parented, enabled
+/// or disabled collider, shape, collision groups, sensor status, parent body type or dominance)
+/// invalidates the stored manifold data, so it triggers a catch-up detection before the solve.
+const COLLISIONS_LAST_DEFERRABLE_CHANGES: ColliderChanges = ColliderChanges::IN_MODIFIED_SET
+    .union(ColliderChanges::POSITION)
+    .union(ColliderChanges::LOCAL_MASS_PROPERTIES);
+
 impl PhysicsPipeline {
     fn clear_modified_colliders(
         &mut self,
@@ -264,6 +290,7 @@ impl PhysicsPipeline {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn step_inner(
         &mut self,
+        mode: StepMode,
         gravity: Vector,
         integration_parameters: &IntegrationParameters,
         islands: &mut IslandManager,
@@ -378,28 +405,74 @@ impl PhysicsPipeline {
                 .update_rigid_bodies_internal(bodies, true, false, false);
         }
 
-        self.detect_collisions(
-            integration_parameters,
-            islands,
-            broad_phase,
-            narrow_phase,
-            bodies,
-            colliders,
-            impulse_joints,
-            multibody_joints,
-            &modified_colliders,
-            &removed_colliders,
-            hooks,
-            events,
-            true,
-        );
+        // Collisions-last defers the detection to the end of the step, unless a user change
+        // invalidated the contacts the solve would use: then it catches up here, like `Standard`.
+        let defer_detection = mode == StepMode::CollisionsLast
+            && !modified_colliders.iter().any(|handle| {
+                colliders.get(*handle).is_some_and(|co| {
+                    !co.changes
+                        .difference(COLLISIONS_LAST_DEFERRABLE_CHANGES)
+                        .is_empty()
+                })
+            });
 
-        self.counters.stages.user_changes.resume();
-        self.clear_modified_colliders(colliders, &mut modified_colliders);
-        self.clear_modified_bodies(bodies, &mut modified_bodies);
-        removed_colliders.clear();
-        self.counters.stages.user_changes.pause();
+        if defer_detection {
+            // The island build and the solve must not see the pairs of removed colliders nor
+            // the stale colors and island links of modified ones, so apply the narrow-phase
+            // part of the user changes now. The broad-phase and the contacts are updated by
+            // the end-of-step detection, which gets both lists (with their change flags).
+            self.counters.stages.collision_detection_time.resume();
+            self.counters.cd.narrow_phase_time.resume();
+            narrow_phase.handle_user_changes(
+                Some(islands),
+                &modified_colliders,
+                &removed_colliders,
+                colliders,
+                bodies,
+                events,
+            );
+            self.counters.cd.narrow_phase_time.pause();
+            self.counters.stages.collision_detection_time.pause();
 
+            self.counters.stages.user_changes.resume();
+            self.clear_modified_bodies(bodies, &mut modified_bodies);
+            self.counters.stages.user_changes.pause();
+        } else {
+            self.detect_collisions(
+                integration_parameters,
+                islands,
+                broad_phase,
+                narrow_phase,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                &modified_colliders,
+                &removed_colliders,
+                hooks,
+                events,
+                true,
+            );
+
+            self.counters.stages.user_changes.resume();
+            self.clear_modified_colliders(colliders, &mut modified_colliders);
+            self.clear_modified_bodies(bodies, &mut modified_bodies);
+            removed_colliders.clear();
+            self.counters.stages.user_changes.pause();
+        }
+
+        if mode == StepMode::CollisionsLastInit {
+            // No solve: hand the tree back so queries between the initialization and the
+            // first step see the whole broad-phase.
+            self.join_deferred_bvh_optimize(broad_phase);
+            colliders.set_modified(modified_colliders);
+            self.counters.step_completed();
+            return;
+        }
+
+        // The loop below overwrites its copy's `dt` with each substep's length; the
+        // end-of-step detection of collisions-last uses the parameters of the whole step.
+        let step_parameters = integration_parameters;
         let mut remaining_time = integration_parameters.dt;
         let mut integration_parameters = *integration_parameters;
 
@@ -535,6 +608,9 @@ impl PhysicsPipeline {
                 self.counters.cd.final_broad_phase_time.pause();
                 self.counters.stages.collision_detection_time.pause();
 
+                // Both lists are empty here unless collisions-last deferred the user changes,
+                // in which case this detection is the first to apply them to the broad-phase
+                // (their narrow-phase part was applied before the loop).
                 self.detect_collisions(
                     &integration_parameters,
                     islands,
@@ -545,13 +621,14 @@ impl PhysicsPipeline {
                     impulse_joints,
                     multibody_joints,
                     &modified_colliders,
-                    &[],
+                    &removed_colliders,
                     hooks,
                     events,
                     false,
                 );
 
                 self.clear_modified_colliders(colliders, &mut modified_colliders);
+                removed_colliders.clear();
             } else {
                 // If we ran the last substep, just update the broad-phase bvh instead
                 // of a full collision-detection step. Internal motion doesn't go
@@ -573,6 +650,57 @@ impl PhysicsPipeline {
         //       not modified by the user in the mean time.
         // NOTE: the world mass-properties of the bodies that moved were refreshed by
         //       `advance_to_final_positions`.
+
+        if mode == StepMode::CollisionsLast {
+            // Detect collisions at the end-of-step poses, with the user changes not applied
+            // by a detection yet (their narrow-phase part was applied before the loop).
+            self.detect_collisions(
+                step_parameters,
+                islands,
+                broad_phase,
+                narrow_phase,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                &modified_colliders,
+                &removed_colliders,
+                hooks,
+                events,
+                false,
+            );
+
+            // Reconcile the solver contact graph with the pairs this detection changed now,
+            // instead of at the next solve. The narrow-phase keeps that pending list only until
+            // its next contact update (which replaces it) and doesn't serialize it, so a
+            // catch-up detection at the start of the next step, or a snapshot taken between
+            // steps, would lose it. The maintenance only needs a consistent active set, which
+            // the wake-ups of the detection keep (they bump the island epoch, forcing a
+            // rebuild). Re-running it at the next solve is idempotent.
+            self.counters
+                .stages
+                .island_constraints_collection_time
+                .resume();
+            narrow_phase.maintain_solver_contact_graph(
+                islands,
+                bodies,
+                colliders,
+                multibody_joints,
+            );
+            self.counters
+                .stages
+                .island_constraints_collection_time
+                .pause();
+
+            self.counters.stages.user_changes.resume();
+            self.clear_modified_colliders(colliders, &mut modified_colliders);
+            removed_colliders.clear();
+            self.counters.stages.user_changes.pause();
+
+            // The detection may have moved the tree into a deferred optimization: put it back,
+            // or scene queries and snapshots between steps would see an empty broad-phase.
+            self.join_deferred_bvh_optimize(broad_phase);
+        }
 
         // Re-insert the modified vector we extracted for the borrow-checker.
         colliders.set_modified(modified_colliders);
