@@ -1,7 +1,9 @@
 #[cfg(feature = "alloc")]
 use crate::dynamics::{RigidBodyHandle, RigidBodySet};
 #[cfg(feature = "alloc")]
-use crate::geometry::{ColliderHandle, ColliderSet, ContactManifold, SolverContacts, SolverFlags};
+use crate::geometry::{
+    AdhesionBudget, ColliderHandle, ColliderSet, ContactManifold, SolverContacts, SolverFlags,
+};
 #[cfg(feature = "alloc")]
 use crate::math::{Real, Vector};
 #[cfg(feature = "alloc")]
@@ -63,10 +65,68 @@ pub struct ContactModificationContext<'a> {
     // NOTE: we keep this a &'a mut u32 to emphasize the
     // fact that this can be modified.
     pub user_data: &'a mut u32,
+    /// Requests an attractive adhesion force pulling the two bodies together (e.g. glue, suction).
+    ///
+    /// Applied as an external force along the contact normal, spread over the solver contacts,
+    /// right before the contact solver runs, so the push-only contacts still provide the reaction
+    /// (and hence friction): the bodies hold together until the load exceeds the adhesion.
+    /// Reset to `0.0` before each call (adhesion is re-requested every time the hook runs, unlike
+    /// `user_data`); non-positive values are ignored.
+    ///
+    /// This is an absolute force *per manifold*: a body resting on a surface split into N
+    /// colliders spans ~N manifolds and receives ~N× the total pull. Use
+    /// [`Self::adhesion_pressure`] or [`Self::adhesion_budget`] when the adhesion should be
+    /// independent of how the surface is decomposed into colliders.
+    ///
+    /// Only dynamic, awake bodies are pulled, and never a body the solver treats as
+    /// world-attached for this contact because of its higher dominance group (it gets no
+    /// contact reaction either).
+    pub adhesion_force: &'a mut Real,
+    /// Requests an attractive adhesion *pressure*: force per unit of contact-patch extent
+    /// (per meter of contact length in 2D, per square meter of contact area in 3D).
+    ///
+    /// The engine converts it to a force by multiplying with the manifold's tangential extent
+    /// (see [`Self::tangential_extent`]) measured *after* this hook returns, and applies it
+    /// exactly like [`Self::adhesion_force`] (the two add up). Because abutting colliders' contact
+    /// spans partition the body's total contact patch, the total force and torque are the same
+    /// whether the surface is one big collider or many small ones — unlike `adhesion_force`,
+    /// which multiplies with the manifold count.
+    ///
+    /// Point contacts (2D) and point/line contacts (3D) have zero extent and receive no pressure
+    /// adhesion; use `adhesion_force` or `adhesion_budget` for those. Reset to `0.0` before each
+    /// call; non-positive values are ignored.
+    pub adhesion_pressure: &'a mut Real,
+    /// Enrolls this manifold in a *budgeted* adhesion pool; see [`AdhesionBudget`].
+    ///
+    /// All manifolds enrolled with the same `(owner, channel)` key during the same timestep share
+    /// a single total adhesion force (the maximum of their requested totals), distributed over
+    /// them proportionally to their tangential extent (with a small floor so point contacts
+    /// participate). Use this when one number should mean "this region of my body is exactly this
+    /// sticky" regardless of how many colliders, tiles, overlaps, or seams implement the contact.
+    ///
+    /// Adds up with [`Self::adhesion_force`] and [`Self::adhesion_pressure`] if those are also
+    /// set. Reset to `None` before each call.
+    pub adhesion_budget: &'a mut Option<AdhesionBudget>,
 }
 
 #[cfg(feature = "alloc")]
 impl ContactModificationContext<'_> {
+    /// The tangential extent of the contact patch described by the *current* content of
+    /// `self.solver_contacts` and `self.normal`: the spread of the contact points perpendicular
+    /// to the normal (a length in 2D, an area in 3D).
+    ///
+    /// This is the value the engine multiplies [`Self::adhesion_pressure`] by — except the engine
+    /// measures it after the hook returns, so contacts added/removed/moved by the hook are taken
+    /// into account. Returns `0.0` for point contacts (and line contacts in 3D).
+    ///
+    /// Note: during contact modification, `self.manifold.data.solver_contacts` is empty (its
+    /// content has been moved into `self.solver_contacts`), so this helper must be used instead of
+    /// [`crate::geometry::ContactManifoldData::tangential_extent`], which returns the value cached
+    /// when the hook last ran.
+    pub fn tangential_extent(&self) -> Real {
+        crate::geometry::solver_contacts_tangential_extent(*self.normal, &self.solver_contacts[..])
+    }
+
     /// Helper function to update `self` to emulate a oneway-platform.
     ///
     /// The "oneway" behavior will only allow contacts between two colliders
@@ -253,6 +313,16 @@ pub trait PhysicsHooks: crate::utils::MaybeSync {
     /// as 0 and can be modified in `context.user_data`.
     ///
     /// The world-space contact normal can be modified in `context.normal`.
+    ///
+    /// An attractive adhesion pulling the two bodies together can be requested through
+    /// `context.adhesion_force` (absolute force per manifold), `context.adhesion_pressure`
+    /// (force per unit of contact extent — composition-invariant), or `context.adhesion_budget`
+    /// (a fixed total shared by all manifolds of a pool — composition- *and* overlap-invariant);
+    /// see [`ContactModificationContext::adhesion_force`],
+    /// [`ContactModificationContext::adhesion_pressure`] and
+    /// [`ContactModificationContext::adhesion_budget`]. The request is stored on the manifold
+    /// ([`ContactManifoldData::adhesion_force`](crate::geometry::ContactManifoldData::adhesion_force)
+    /// and siblings) and applied as an external force right before the contact solver runs.
     fn modify_solver_contacts(&self, _context: &mut ContactModificationContext) {}
 }
 

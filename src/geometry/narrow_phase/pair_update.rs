@@ -61,6 +61,10 @@ pub(super) const OUTCOME_FULL_COMPOSITE: u8 = 5;
 // incremental reconcile needs, so the graph must be rebuilt from scratch (rare).
 pub(super) const OUTCOME_CLEARED_IN_GRAPH: u8 = 6;
 
+/// `ContactRecycleState::max_drift` of a pair whose last full update stored an adhesion request:
+/// below any real drift, so the pair can't be recycled from that state.
+const ADHESION_POISONED_MAX_DRIFT: Real = -1.0;
+
 /// The per-pair contact update shared by `NarrowPhase::compute_contacts`'
 /// single-threaded and parallel dispatch paths; returns an `OUTCOME_*` tag.
 #[allow(clippy::too_many_arguments)]
@@ -381,6 +385,11 @@ pub(super) fn process_pair(
                 manifold.data.relative_dominance =
                     dominance1.effective_group(&rb_type1) - dominance2.effective_group(&rb_type2);
                 manifold.data.normal = world_pos1.rotation * manifold.local_n1;
+                // Adhesion is requested on (and applied through) the clusters only.
+                manifold.data.adhesion_force = 0.0;
+                manifold.data.adhesion_pressure = 0.0;
+                manifold.data.adhesion_budget = None;
+                manifold.data.adhesion_extent = 0.0;
             }
         } else if !pair.solver_clusters.is_empty() {
             // Clustering stopped applying to this pair: carry the warm-start
@@ -399,6 +408,10 @@ pub(super) fn process_pair(
         } else {
             &mut pair.manifolds
         };
+
+        // Whether the hook requested a positive adhesion on any solver manifold of this full
+        // update: such a pair must not be recycled from this update (see below).
+        let mut adhesion_requested = false;
 
         for manifold in solver_manifolds {
             let world_pos1 = manifold.subshape_pos1().prepend_to(&co1.pos);
@@ -505,6 +518,11 @@ pub(super) fn process_pair(
                 let mut modifiable_normal = manifold.data.normal;
                 let mut modifiable_friction = manifold.data.friction;
                 let mut modifiable_restitution = manifold.data.restitution;
+                // Adhesion is re-requested by the hook every time it runs (not persistent
+                // like `user_data`).
+                let mut modifiable_adhesion_force = 0.0;
+                let mut modifiable_adhesion_pressure = 0.0;
+                let mut modifiable_adhesion_budget = None;
 
                 let mut context = ContactModificationContext {
                     bodies,
@@ -519,6 +537,9 @@ pub(super) fn process_pair(
                     friction: &mut modifiable_friction,
                     restitution: &mut modifiable_restitution,
                     user_data: &mut modifiable_user_data,
+                    adhesion_force: &mut modifiable_adhesion_force,
+                    adhesion_pressure: &mut modifiable_adhesion_pressure,
+                    adhesion_budget: &mut modifiable_adhesion_budget,
                 };
 
                 hooks.modify_solver_contacts(&mut context);
@@ -528,6 +549,26 @@ pub(super) fn process_pair(
                 manifold.data.friction = modifiable_friction;
                 manifold.data.restitution = modifiable_restitution;
                 manifold.data.user_data = modifiable_user_data;
+                adhesion_requested |= modifiable_adhesion_force > 0.0
+                    || modifiable_adhesion_pressure > 0.0
+                    || modifiable_adhesion_budget.is_some_and(|budget| budget.total > 0.0);
+                manifold.data.adhesion_force = modifiable_adhesion_force;
+                manifold.data.adhesion_pressure = modifiable_adhesion_pressure;
+                manifold.data.adhesion_budget = modifiable_adhesion_budget;
+                // Measure the patch now: the anchors are still world-space here, and are
+                // localized right below.
+                manifold.data.adhesion_extent = crate::geometry::solver_contacts_tangential_extent(
+                    manifold.data.normal,
+                    &manifold.data.solver_contacts,
+                );
+            } else {
+                // Adhesion must be re-requested each time: if the hook flag was removed while
+                // this manifold is alive, the last requested value must not linger as a
+                // phantom force.
+                manifold.data.adhesion_force = 0.0;
+                manifold.data.adhesion_pressure = 0.0;
+                manifold.data.adhesion_budget = None;
+                manifold.data.adhesion_extent = 0.0;
             }
 
             // Localize solver contacts: bake skins (and hook-written `dist`) into the anchors, then
@@ -598,7 +639,10 @@ pub(super) fn process_pair(
             // A pair without contacts has an (unknown) separation larger than
             // the prediction distance. Cap its recycle window by the
             // prediction distance so an incoming contact can't be missed.
-            let max_drift = if pair.has_any_active_contact() {
+            let max_drift = if adhesion_requested {
+                // Poisoned (see below).
+                ADHESION_POISONED_MAX_DRIFT
+            } else if pair.has_any_active_contact() {
                 contact_recycle_distance
             } else {
                 contact_recycle_distance.min(prediction_distance)
@@ -610,7 +654,19 @@ pub(super) fn process_pair(
                 max_extent,
                 max_drift,
             });
+        } else if adhesion_requested {
+            // Recycling is off this step, but a state stored earlier may still be used once
+            // it is turned back on: poison it too.
+            if let Some(state) = &mut pair.recycle_state {
+                state.max_drift = ADHESION_POISONED_MAX_DRIFT;
+            }
         }
+        // Why poison: pairs with hooks are never recycled, but `Collider::set_active_hooks`
+        // doesn't flag a collider change, so once the hook flag is removed this pair could be
+        // recycled with the adhesion stored above still on its manifolds, a force nobody
+        // requests anymore. A negative drift bound fails the recycle test, so the next update
+        // is a full one, whose no-hook branch resets the adhesion and stores a normal state.
+        // Pairs that never request adhesion never reach this, so they pay nothing.
     }
 
     /*

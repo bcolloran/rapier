@@ -273,7 +273,9 @@ pub(crate) struct ContactRecycleState {
     pub max_extent: Real,
     /// The maximum relative-pose drift below which this pair can be recycled,
     /// precomputed at the last full update (it depends on whether the pair had
-    /// active contacts, which recycling doesn't change).
+    /// active contacts, which recycling doesn't change). Negative when the pair must not be
+    /// recycled from this state: its full update stored an adhesion request, which only a full
+    /// update can clear once the hook flag is gone.
     pub max_drift: Real,
 }
 
@@ -579,6 +581,93 @@ pub struct ContactManifoldData {
     /// The effective restitution coefficient of this manifold's contacts.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub restitution: Real,
+    /// Attractive adhesion force pulling the two bodies together (e.g. glue or suction).
+    ///
+    /// Applied along [`Self::normal`] (spread over [`Self::solver_contacts`]) as an external
+    /// force on both bodies before the contact solver runs, so the push-only contacts provide
+    /// the reaction (and hence friction). `0.0` (default) is an ordinary contact; non-positive
+    /// values are ignored. Written by the narrow-phase each time
+    /// [`PhysicsHooks::modify_solver_contacts`] runs on this manifold (reset to `0.0` when the
+    /// pair has no [`ActiveHooks::MODIFY_SOLVER_CONTACTS`]).
+    ///
+    /// This is an absolute force *per manifold*: a surface split into N colliders produces ~N
+    /// manifolds and therefore ~N× the total pull. For adhesion that behaves identically on a
+    /// monolithic surface and on the same surface decomposed into many small colliders, use
+    /// [`Self::adhesion_pressure`] or [`Self::adhesion_budget`] instead.
+    ///
+    /// Serialized: a restored snapshot resumes with the adhesion requested before it was taken.
+    ///
+    /// [`PhysicsHooks::modify_solver_contacts`]: crate::pipeline::PhysicsHooks::modify_solver_contacts
+    /// [`ActiveHooks::MODIFY_SOLVER_CONTACTS`]: crate::pipeline::ActiveHooks::MODIFY_SOLVER_CONTACTS
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub adhesion_force: Real,
+    /// Attractive adhesion *pressure* pulling the two bodies together, expressed per unit of
+    /// contact patch: force per meter of contact length in 2D, force per square meter of contact
+    /// area in 3D.
+    ///
+    /// The resulting force for this manifold is `adhesion_pressure * tangential_extent()`, applied
+    /// exactly like [`Self::adhesion_force`] (the two add up). Because the contact spans of
+    /// abutting colliders partition the body's total contact patch, this formulation is
+    /// composition-invariant: splitting one big collider into many small ones leaves the total
+    /// adhesion force (and its torque) unchanged. The flip side is that point contacts (2D) and
+    /// point/line contacts (3D) have zero extent and receive no pressure adhesion — use
+    /// [`Self::adhesion_force`] or [`Self::adhesion_budget`] for those. Overlapping colliders
+    /// double-count the overlapped span; [`Self::adhesion_budget`] does not.
+    ///
+    /// `0.0` (default) is an ordinary contact; non-positive values are ignored. Written like
+    /// [`Self::adhesion_force`].
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub adhesion_pressure: Real,
+    /// Membership of this manifold in a budgeted adhesion pool (see [`AdhesionBudget`]).
+    ///
+    /// `None` (default) is an ordinary contact. Written like [`Self::adhesion_force`].
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub adhesion_budget: Option<AdhesionBudget>,
+    /// The tangential extent of [`Self::solver_contacts`] measured right after the
+    /// contact-modification hook last ran on this manifold (see [`Self::tangential_extent`]);
+    /// `0.0` for manifolds of pairs without `MODIFY_SOLVER_CONTACTS`.
+    ///
+    /// Cached because the solver contacts are converted to body-local anchors right after the
+    /// hook, after which the world-space patch can no longer be measured cheaply.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub(crate) adhesion_extent: Real,
+}
+
+/// A *budgeted* adhesion request: a fixed total adhesion force shared by every manifold enrolled
+/// in the same pool during the same timestep.
+///
+/// This is the right model for "this region of my body has stickiness `total`": however many
+/// manifolds happen to implement the region's contact this step — one big collider, many abutting
+/// tiles, *overlapping* colliders, a seam-straddling pair of point contacts — the force applied
+/// across all of them always sums to exactly `total`. Neither
+/// [`ContactManifoldData::adhesion_force`] (which multiplies with the manifold count) nor
+/// [`ContactManifoldData::adhesion_pressure`] (which double-counts overlapping coverage and
+/// vanishes on point contacts) has that property.
+///
+/// Pools are keyed by `(owner, channel)`:
+/// - `owner` is an opaque identity, never dereferenced by the engine — typically the collider the
+///   budget belongs to (e.g. a player capsule). Distinct bodies must use distinct owners or their
+///   budgets merge.
+/// - `channel` distinguishes independent regions of the same owner (e.g. `0` = feet, `1` = flank),
+///   so a body in a corner can spend its feet budget *and* its flank budget simultaneously.
+///
+/// Within a pool, the effective total is the **maximum** of the enrolled manifolds' `total`
+/// requests (max, not sum, so duplicated or overlapping colliders can never inflate it), and it is
+/// distributed over the enrolled manifolds proportionally to their tangential extent (point
+/// contacts get a small floor weight, so a lone point contact still receives the full total, while
+/// a degenerate sliver alongside real area contacts receives almost nothing).
+///
+/// Only manifolds actually seen by the constraint solver this step (at least one solver contact,
+/// at least one awake dynamic body) take part in a pool.
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+pub struct AdhesionBudget {
+    /// Opaque pool identity; typically the collider this budget belongs to.
+    pub owner: ColliderHandle,
+    /// Distinguishes independent budgets of the same owner (e.g. feet vs. flank).
+    pub channel: u32,
+    /// Total adhesion force shared by the pool this step. Non-positive values are ignored.
+    pub total: Real,
 }
 
 /// A single solver contact.
@@ -803,6 +892,10 @@ impl ContactManifoldData {
             user_data: 0,
             friction: 0.0,
             restitution: 0.0,
+            adhesion_force: 0.0,
+            adhesion_pressure: 0.0,
+            adhesion_budget: None,
+            adhesion_extent: 0.0,
         }
     }
 
@@ -844,6 +937,141 @@ impl ContactManifoldData {
     pub fn num_active_contacts(&self) -> usize {
         self.solver_contacts.len()
     }
+
+    /// The tangential extent of this manifold's contact patch: the spread of its solver contact
+    /// points perpendicular to [`Self::normal`] (a length in 2D, an area in 3D).
+    ///
+    /// This is what [`Self::adhesion_pressure`] gets multiplied by, and the weight of this
+    /// manifold in its [`Self::adhesion_budget`] pool. Manifolds with fewer than 2 (2D) / 3 (3D)
+    /// solver contacts — point and line contacts — have zero extent.
+    ///
+    /// This is the value cached when the contact-modification hook last ran on this manifold
+    /// (measured right after the hook returned, so contacts it added, removed or moved count),
+    /// not a fresh measurement: it is `0.0` for manifolds of pairs without
+    /// [`ActiveHooks::MODIFY_SOLVER_CONTACTS`], and keeps its value while the pair is not
+    /// updated (e.g. both bodies asleep).
+    ///
+    /// [`ActiveHooks::MODIFY_SOLVER_CONTACTS`]: crate::pipeline::ActiveHooks::MODIFY_SOLVER_CONTACTS
+    #[inline]
+    pub fn tangential_extent(&self) -> Real {
+        self.adhesion_extent
+    }
+}
+
+/// The world-space effective point of a solver contact (the midpoint of its two anchors).
+///
+/// Only meaningful while the anchors still hold world-space points, i.e. inside the
+/// contact-modification hook and before the narrow-phase localizes them.
+#[inline]
+fn solver_contact_world_midpoint(contact: &SolverContact) -> Vector {
+    (contact.anchor1 + contact.anchor2) * 0.5
+}
+
+/// Tangential extent (2D: length) of a set of solver contacts perpendicular to `normal`: the
+/// spread of their projections on the contact tangent. Fewer than 2 contacts give `0.0`.
+///
+/// Reads world-space anchors, so it is only valid before the narrow-phase localizes them (inside
+/// the contact-modification hook, or right after it). Assumes `normal` is unit-length.
+#[cfg(feature = "dim2")]
+pub(crate) fn solver_contacts_tangential_extent(
+    normal: Vector,
+    contacts: &[SolverContact],
+) -> Real {
+    use crate::utils::OrthonormalBasis;
+
+    if contacts.len() < 2 {
+        return 0.0;
+    }
+
+    let tangent = normal.orthonormal_vector();
+    let mut min_s = tangent.dot(solver_contact_world_midpoint(&contacts[0]));
+    let mut max_s = min_s;
+    for contact in &contacts[1..] {
+        let s = tangent.dot(solver_contact_world_midpoint(contact));
+        min_s = min_s.min(s);
+        max_s = max_s.max(s);
+    }
+    max_s - min_s
+}
+
+/// Tangential extent (3D: area) of a set of solver contacts perpendicular to `normal`.
+///
+/// This is the area of the polygon formed by the contact points projected on the plane orthogonal
+/// to `normal` (points ordered by angle about their centroid), which is exact for contact points
+/// in convex position — the case produced by the narrow phase. Fewer than 3 contacts give `0.0`.
+///
+/// Reads world-space anchors, so it is only valid before the narrow-phase localizes them (inside
+/// the contact-modification hook, or right after it). Assumes `normal` is unit-length.
+///
+/// Allocation-free for up to 4 contacts (every manifold the narrow-phase reduces); larger
+/// hook-edited sets fall back to a heap buffer. The ordering is an insertion sort over angles
+/// computed once each with the crate's `atan2` (libm under `enhanced-determinism`), so the
+/// result is deterministic.
+#[cfg(feature = "dim3")]
+pub(crate) fn solver_contacts_tangential_extent(
+    normal: Vector,
+    contacts: &[SolverContact],
+) -> Real {
+    use crate::utils::OrthonormalBasis;
+
+    let n = contacts.len();
+    if n < 3 {
+        return 0.0;
+    }
+
+    let [b1, b2] = normal.orthonormal_basis();
+    let project = |c: &SolverContact| {
+        let p = solver_contact_world_midpoint(c);
+        [b1.dot(p), b2.dot(p), 0.0]
+    };
+
+    let mut stack: [[Real; 3]; 4] = [[0.0; 3]; 4];
+    let mut heap: Vec<[Real; 3]>;
+    let pts: &mut [[Real; 3]] = if n <= stack.len() {
+        for (dst, c) in stack.iter_mut().zip(contacts) {
+            *dst = project(c);
+        }
+        &mut stack[..n]
+    } else {
+        heap = contacts.iter().map(project).collect();
+        &mut heap
+    };
+
+    let inv_n = 1.0 / n as Real;
+    let (mut cx, mut cy): (Real, Real) = (0.0, 0.0);
+    for p in pts.iter() {
+        cx += p[0];
+        cy += p[1];
+    }
+    cx *= inv_n;
+    cy *= inv_n;
+
+    // Angle about the centroid, stored in the third slot and computed once per point. Called
+    // through `RealField` (not the inherent `f32::atan2`) so `enhanced-determinism` routes it
+    // through libm.
+    for p in pts.iter_mut() {
+        p[2] = <Real as simba::scalar::RealField>::atan2(p[1] - cy, p[0] - cx);
+    }
+
+    // Stable insertion sort by angle (small `n`, no allocation, NaN angles stay in place).
+    for i in 1..n {
+        let key = pts[i];
+        let mut j = i;
+        while j > 0 && pts[j - 1][2] > key[2] {
+            pts[j] = pts[j - 1];
+            j -= 1;
+        }
+        pts[j] = key;
+    }
+
+    let mut twice_area = 0.0;
+    for i in 0..n {
+        let p = pts[i];
+        let q = pts[(i + 1) % n];
+        twice_area += p[0] * q[1] - q[0] * p[1];
+    }
+    let area = twice_area * 0.5;
+    if area < 0.0 { -area } else { area }
 }
 
 /// Additional methods for the contact manifold.
