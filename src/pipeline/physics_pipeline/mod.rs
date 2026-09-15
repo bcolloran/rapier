@@ -276,24 +276,54 @@ impl PhysicsPipeline {
     ///
     /// # User changes between steps
     ///
-    /// Changes made to colliders and bodies between steps are applied to the narrow-phase before
-    /// the solve: removed colliders lose their contact pairs, and the pairs of modified colliders
-    /// are woken and recolored. Their contacts are only recomputed at the end of the step, except
-    /// when a change invalidates the contacts the solve would use. On steps where a collider is
-    /// inserted, re-parented, enabled or disabled, or changes its shape, collision groups or
-    /// sensor status, or its parent body changes type or dominance, a full collision detection
-    /// (a catch-up) also runs before the solve:
+    /// Changes made between steps are applied to the narrow-phase before the solve: removed
+    /// colliders lose their contact pairs, and the pairs of modified colliders are woken and
+    /// recolored. The contacts themselves are recomputed by the collision detection at the end of
+    /// the step, after the solve, except when a change invalidates the contacts the solve would
+    /// use. Then a full collision detection (a catch-up) also runs before the solve, as in
+    /// [`step`](Self::step). The catch-up runs on steps where:
+    ///
+    /// - a collider is inserted, enabled or disabled (also by enabling or disabling its body);
+    /// - a collider changes its shape, collision groups, sensor status or parent body;
+    /// - a collider's parent body changes type or dominance group;
+    /// - an impulse joint or a multibody joint is inserted or removed (a joint can disable the
+    ///   contacts between its bodies).
+    ///
+    /// On catch-up steps:
     ///
     /// - Inserted colliders get their contacts before that step's solve (instead of one step
     ///   later).
-    /// - Collision detection runs twice on those steps, so the physics hooks may be called twice
-    ///   for the same pair. Collision events are only emitted when a pair starts or stops
-    ///   touching, so they are not duplicated: a contact that starts during the catch-up is not
-    ///   reported again by the end-of-step detection.
+    /// - Collision detection runs twice, so the physics hooks may be called twice for the same
+    ///   pair. Collision events are only emitted when a pair starts or stops touching, so they are
+    ///   not duplicated: a contact that starts during the catch-up is not reported again by the
+    ///   end-of-step detection.
     ///
-    /// A position-only change (for example a teleport) or a collider removal does not trigger
-    /// the catch-up: that step's solve uses the contacts detected at the previous poses, and the
-    /// broad-phase only sees the change at the end of the step.
+    /// Every other change reaches the contacts one step late: that step's solve still uses the
+    /// contacts detected at the end of the previous step, and only the end-of-step detection
+    /// applies the change. This includes:
+    ///
+    /// - Position-only changes (teleports). The solve uses the contacts detected at the previous
+    ///   poses, and the broad-phase only sees the new pose at the end of the step. CCD sweeps in the
+    ///   same step therefore still see a collider teleported that step at its old position, so a
+    ///   fast body can tunnel through a wall moved into its path.
+    /// - Removals of colliders and bodies. Their contact pairs leave the solve right away, but a
+    ///   body that lost a collider keeps its other contacts anchored to its previous center of
+    ///   mass for that solve, and the broad-phase only drops the removed colliders at the end of
+    ///   the step.
+    /// - Friction and restitution coefficients and their combine rules: the solve uses the values
+    ///   combined by the last detection.
+    /// - Active hooks and active collision types: that step's contacts were filtered and modified
+    ///   under the previous flags. Active events: collision events follow the new flags from the
+    ///   end-of-step detection, which emits them (contact-force events already follow them in that
+    ///   step's solve).
+    /// - Center-of-mass changes (a collider's mass properties, a body's additional mass
+    ///   properties): the stored solver contacts are anchored relative to the previous center of
+    ///   mass, so that solve applies them at slightly wrong points.
+    /// - Edits to an existing joint, such as enabling or disabling the contacts between its
+    ///   bodies: only inserting or removing a joint triggers the catch-up.
+    ///
+    /// When CCD splits a step into substeps, the detection that runs between two substeps applies
+    /// these changes already, after the first substep's solve rather than at the end of the step.
     ///
     /// # Snapshots
     ///
@@ -410,7 +440,9 @@ impl PhysicsPipeline {
     /// ([`step_collisions_last`](Self::step_collisions_last)).
     ///
     /// It applies the pending user changes and detects collisions at the current body
-    /// positions, without moving anything. Afterwards the narrow-phase holds the contact and
+    /// positions, without integrating. No body moves, except the links of multibodies, which
+    /// forward kinematics places from their joint coordinates (as at the start of every step).
+    /// Afterwards the narrow-phase holds the contact and
     /// intersection data at t=0, which you can read before the first step. Physics hooks and
     /// collision events run as they would during a step.
     ///

@@ -586,7 +586,8 @@ pub struct ContactManifoldData {
     /// Applied along [`Self::normal`] (spread over [`Self::solver_contacts`]) as an external
     /// force on both bodies before the contact solver runs, so the push-only contacts provide
     /// the reaction (and hence friction). `0.0` (default) is an ordinary contact; non-positive
-    /// values are ignored. Written by the narrow-phase each time
+    /// and non-finite values are ignored (a non-finite value adds nothing, and doesn't cancel the
+    /// manifold's other adhesion terms). Written by the narrow-phase each time
     /// [`PhysicsHooks::modify_solver_contacts`] runs on this manifold (reset to `0.0` when the
     /// pair has no [`ActiveHooks::MODIFY_SOLVER_CONTACTS`]).
     ///
@@ -594,6 +595,17 @@ pub struct ContactManifoldData {
     /// manifolds and therefore ~N× the total pull. For adhesion that behaves identically on a
     /// monolithic surface and on the same surface decomposed into many small colliders, use
     /// [`Self::adhesion_pressure`] or [`Self::adhesion_budget`] instead.
+    ///
+    /// For a 3D pair whose manifolds are clustered for the solver
+    /// ([`ContactPair::solver_clusters`] is not empty), the hook runs on the clusters, so the
+    /// adhesion request ([`Self::adhesion_force`], [`Self::adhesion_pressure`],
+    /// [`Self::adhesion_budget`]) and [`Self::tangential_extent`] live on the clusters (see
+    /// [`ContactPair::solver_manifolds`]); the pair's plain [`ContactPair::manifolds`] show `0.0`
+    /// and `None`.
+    ///
+    /// The adhesion is added to the bodies' effective force for the solve, and that force is still
+    /// in place when the next step starts, so the next step's CCD activation check (which predicts
+    /// each body's motion from its velocity and forces) sees it.
     ///
     /// Serialized: a restored snapshot resumes with the adhesion requested before it was taken.
     ///
@@ -614,8 +626,9 @@ pub struct ContactManifoldData {
     /// [`Self::adhesion_force`] or [`Self::adhesion_budget`] for those. Overlapping colliders
     /// double-count the overlapped span; [`Self::adhesion_budget`] does not.
     ///
-    /// `0.0` (default) is an ordinary contact; non-positive values are ignored. Written like
-    /// [`Self::adhesion_force`].
+    /// `0.0` (default) is an ordinary contact; non-positive and non-finite values are ignored, and
+    /// so is a non-finite product with the extent (an infinite pressure on a point contact).
+    /// Written like [`Self::adhesion_force`].
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub adhesion_pressure: Real,
     /// Membership of this manifold in a budgeted adhesion pool (see [`AdhesionBudget`]).
@@ -659,6 +672,13 @@ pub struct ContactManifoldData {
 ///
 /// Only manifolds actually seen by the constraint solver this step (at least one solver contact,
 /// at least one awake dynamic body) take part in a pool.
+///
+/// A member's share is computed from the whole pool before the engine checks which of the member's
+/// two bodies it can pull: only awake dynamic bodies are pulled, and never a side the solver
+/// treats as world-attached through dominance. A member whose pullable side is skipped (kinematic,
+/// fixed, sleeping, or dominance-world-attached) still takes its share of the pool's weight, and
+/// that share pulls nothing on that side. So the shares of a pool add up to its total only when
+/// every member's pullable side is actually pulled.
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 pub struct AdhesionBudget {
@@ -666,7 +686,8 @@ pub struct AdhesionBudget {
     pub owner: ColliderHandle,
     /// Distinguishes independent budgets of the same owner (e.g. feet vs. flank).
     pub channel: u32,
-    /// Total adhesion force shared by the pool this step. Non-positive values are ignored.
+    /// Total adhesion force shared by the pool this step. Non-positive and non-finite values are
+    /// ignored: such a request joins no pool.
     pub total: Real,
 }
 
@@ -950,6 +971,9 @@ impl ContactManifoldData {
     /// not a fresh measurement: it is `0.0` for manifolds of pairs without
     /// [`ActiveHooks::MODIFY_SOLVER_CONTACTS`], and keeps its value while the pair is not
     /// updated (e.g. both bodies asleep).
+    ///
+    /// For a 3D pair clustered for the solver, the value lives on the clusters (see
+    /// [`ContactPair::solver_manifolds`]); the pair's plain manifolds return `0.0`.
     ///
     /// [`ActiveHooks::MODIFY_SOLVER_CONTACTS`]: crate::pipeline::ActiveHooks::MODIFY_SOLVER_CONTACTS
     #[inline]

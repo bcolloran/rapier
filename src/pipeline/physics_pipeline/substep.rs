@@ -40,6 +40,7 @@ pub(super) enum StepMode {
 /// keep the stored contacts usable for a solve. Any other change (inserted, re-parented, enabled
 /// or disabled collider, shape, collision groups, sensor status, parent body type or dominance)
 /// invalidates the stored manifold data, so it triggers a catch-up detection before the solve.
+/// Inserting or removing a joint triggers it too (see `joints_changed` in `step_inner`).
 const COLLISIONS_LAST_DEFERRABLE_CHANGES: ColliderChanges = ColliderChanges::IN_MODIFIED_SET
     .union(ColliderChanges::POSITION)
     .union(ColliderChanges::LOCAL_MASS_PROPERTIES);

@@ -71,7 +71,8 @@ pub struct ContactModificationContext<'a> {
     /// right before the contact solver runs, so the push-only contacts still provide the reaction
     /// (and hence friction): the bodies hold together until the load exceeds the adhesion.
     /// Reset to `0.0` before each call (adhesion is re-requested every time the hook runs, unlike
-    /// `user_data`); non-positive values are ignored.
+    /// `user_data`); non-positive and non-finite values are ignored (a non-finite value adds
+    /// nothing, and doesn't cancel the manifold's other adhesion terms).
     ///
     /// This is an absolute force *per manifold*: a body resting on a surface split into N
     /// colliders spans ~N manifolds and receives ~N× the total pull. Use
@@ -81,6 +82,10 @@ pub struct ContactModificationContext<'a> {
     /// Only dynamic, awake bodies are pulled, and never a body the solver treats as
     /// world-attached for this contact because of its higher dominance group (it gets no
     /// contact reaction either).
+    ///
+    /// The adhesion is added to the bodies' effective force for the solve, and that force is still
+    /// in place when the next step starts, so the next step's CCD activation check (which predicts
+    /// each body's motion from its velocity and forces) sees it.
     pub adhesion_force: &'a mut Real,
     /// Requests an attractive adhesion *pressure*: force per unit of contact-patch extent
     /// (per meter of contact length in 2D, per square meter of contact area in 3D).
@@ -94,7 +99,8 @@ pub struct ContactModificationContext<'a> {
     ///
     /// Point contacts (2D) and point/line contacts (3D) have zero extent and receive no pressure
     /// adhesion; use `adhesion_force` or `adhesion_budget` for those. Reset to `0.0` before each
-    /// call; non-positive values are ignored.
+    /// call; non-positive and non-finite values are ignored, and so is a non-finite product with
+    /// the extent (an infinite pressure on a point contact).
     pub adhesion_pressure: &'a mut Real,
     /// Enrolls this manifold in a *budgeted* adhesion pool; see [`AdhesionBudget`].
     ///
@@ -105,7 +111,12 @@ pub struct ContactModificationContext<'a> {
     /// sticky" regardless of how many colliders, tiles, overlaps, or seams implement the contact.
     ///
     /// Adds up with [`Self::adhesion_force`] and [`Self::adhesion_pressure`] if those are also
-    /// set. Reset to `None` before each call.
+    /// set. Reset to `None` before each call. A `total` that is not positive and finite joins no
+    /// pool.
+    ///
+    /// A member whose pullable side is not pulled (kinematic, fixed, sleeping, or world-attached
+    /// through dominance) still takes its share of the pool's weight and applies nothing on that
+    /// side, so the shares add up to the total only when every member's pullable side is pulled.
     pub adhesion_budget: &'a mut Option<AdhesionBudget>,
 }
 
@@ -323,6 +334,11 @@ pub trait PhysicsHooks: crate::utils::MaybeSync {
     /// [`ContactModificationContext::adhesion_budget`]. The request is stored on the manifold
     /// ([`ContactManifoldData::adhesion_force`](crate::geometry::ContactManifoldData::adhesion_force)
     /// and siblings) and applied as an external force right before the contact solver runs.
+    ///
+    /// For a 3D pair whose manifolds are clustered for the solver, this hook runs on the
+    /// clusters, so the request and the tangential extent are stored there (see
+    /// [`ContactPair::solver_manifolds`](crate::geometry::ContactPair::solver_manifolds)); the
+    /// pair's plain [`ContactPair::manifolds`](crate::geometry::ContactPair::manifolds) show zero.
     fn modify_solver_contacts(&self, _context: &mut ContactModificationContext) {}
 }
 
