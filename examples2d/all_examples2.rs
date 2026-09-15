@@ -6,6 +6,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod add_remove2;
+mod adhesion2;
+mod adhesion_climb2;
+mod adhesion_curved2;
+mod adhesion_grid2;
+mod adhesion_slide2;
+mod adhesion_teeter2;
 mod b2d_compounds;
 mod b2d_joint_grid;
 mod b2d_junkyard;
@@ -85,6 +91,7 @@ macro_rules! examples {
 pub async fn main() {
     const COLLISIONS: &str = "Collisions";
     const DYNAMICS: &str = "Dynamics";
+    const ADHESION: &str = "Adhesion";
     const JOINTS: &str = "Joints";
     const CONTROLS: &str = "Controls";
     const DEBUG: &str = "Debug";
@@ -115,6 +122,13 @@ pub async fn main() {
         DYNAMICS, "Restitution", restitution2::run;
         DYNAMICS, "Damping", damping2::run;
         DYNAMICS, "CCD", ccd2::run;
+        // ── Adhesion ────────────────────────────────────────────────────────
+        ADHESION, "Adhesion", adhesion2::run;
+        ADHESION, "Adhesion grid", adhesion_grid2::run;
+        ADHESION, "Adhesion (curved)", adhesion_curved2::run;
+        ADHESION, "Adhesion climb", adhesion_climb2::run;
+        ADHESION, "Adhesion slide", adhesion_slide2::run;
+        ADHESION, "Adhesion teeter", adhesion_teeter2::run;
         // ── Joints ──────────────────────────────────────────────────────────
         JOINTS, "Joints", joints2::run;
         JOINTS, "Rope Joints", rope_joints2::run;
