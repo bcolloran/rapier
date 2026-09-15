@@ -59,6 +59,12 @@ impl NarrowPhase {
     /// solver-selectable is added to `solver_graph_dirty` (kept sorted and deduplicated) so the
     /// next maintenance reconciles its solver-graph and force-event membership.
     ///
+    /// A requalified pair skips the contact update, which is where a pair without
+    /// [`ActiveHooks::MODIFY_SOLVER_CONTACTS`](crate::pipeline::ActiveHooks::MODIFY_SOLVER_CONTACTS)
+    /// has its adhesion request reset. So when neither collider of a pair that becomes
+    /// solver-selectable has that flag (it was removed while the pair slept), the adhesion fields of
+    /// its solver manifolds are zeroed here.
+    ///
     /// Deterministic (the dirty list is sorted) and idempotent (a repaired hint no longer has a
     /// cleared count).
     pub(crate) fn requalify_woken_pair_hints(
@@ -105,6 +111,30 @@ impl NarrowPhase {
                         self.solver_graph_dirty.push(edge_id as u32);
                     }
                 }
+            }
+        }
+        // Stock stepping's contact update resets the adhesion request of a pair without the hook
+        // flag before its solve (it can't recycle a pair whose last full update stored a request).
+        // A requalified pair is solved without that update, so when the flag is gone, drop the
+        // request stored before the pair fell asleep: nobody requests it anymore. A pair that
+        // still has the hook keeps its last request, as it does while asleep. The request lives on
+        // the solver manifolds (3D clusters included). Zeroing an empty request changes nothing.
+        let hooked = |handle: ColliderHandle| {
+            colliders.get(handle).is_some_and(|co| {
+                co.active_hooks()
+                    .contains(crate::pipeline::ActiveHooks::MODIFY_SOLVER_CONTACTS)
+            })
+        };
+        for &edge_id in &self.solver_graph_dirty[num_dirty..] {
+            let pair = &mut self.contact_graph.graph.edges[edge_id as usize].weight;
+            if hooked(pair.collider1) || hooked(pair.collider2) {
+                continue;
+            }
+            for manifold in pair.solver_manifolds_mut() {
+                manifold.data.adhesion_force = 0.0;
+                manifold.data.adhesion_pressure = 0.0;
+                manifold.data.adhesion_budget = None;
+                manifold.data.adhesion_extent = 0.0;
             }
         }
         if self.solver_graph_dirty.len() != num_dirty {

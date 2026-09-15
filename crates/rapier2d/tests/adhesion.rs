@@ -19,6 +19,11 @@ fn step(world: &mut PhysicsWorld, hooks: &dyn PhysicsHooks) {
     world.step_with_events(hooks, &());
 }
 
+/// Advances `world` by one step with `step_collisions_last`, for the tests of that stepping mode.
+fn step_collisions_last(world: &mut PhysicsWorld, hooks: &dyn PhysicsHooks) {
+    world.step_collisions_last_with_events(hooks, &());
+}
+
 fn run(world: &mut PhysicsWorld, hooks: &dyn PhysicsHooks, steps: usize) {
     for _ in 0..steps {
         step(world, hooks);
@@ -1212,4 +1217,181 @@ fn tangential_extent_is_cached_at_hook_time() {
     let plain = world.narrow_phase.contact_pair(floor, rest_co).unwrap();
     assert!(plain.has_any_active_contact());
     assert_eq!(plain.manifolds[0].data.tangential_extent(), 0.0);
+}
+
+#[test]
+fn collisions_last_wake_applies_no_adhesion_after_hook_flag_removal() {
+    // A box held under a ceiling by adhesion falls asleep. The ceiling then loses its hook flag,
+    // which is not a collider change, so the sleeping pair isn't updated and keeps its request.
+    // On the step the box is woken, stock `step` fully updates the pair before its solve (a pair
+    // whose last update stored adhesion can't be recycled), which drops the request: the box
+    // starts to fall. `step_collisions_last` solves before its detection and puts the woken pair
+    // back into the solver without updating it, so the stale request must not hold the box there.
+    let wake_step_velocity = |collisions_last: bool| -> Real {
+        let mut world = new_world();
+        let (ceiling, box_body) = ceiling_and_hanging_box(&mut world);
+        let hook = AdhesionHook {
+            collider: ceiling,
+            force: 30.0,
+        };
+        let advance = |world: &mut PhysicsWorld| {
+            if collisions_last {
+                step_collisions_last(world, &hook);
+            } else {
+                step(world, &hook);
+            }
+        };
+
+        let mut slept = false;
+        for _ in 0..600 {
+            advance(&mut world);
+            if world.bodies[box_body].is_sleeping() {
+                slept = true;
+                break;
+            }
+        }
+        assert!(
+            slept,
+            "the adhered box never fell asleep (collisions_last = {collisions_last})"
+        );
+
+        world.colliders[ceiling].set_active_hooks(ActiveHooks::empty());
+        advance(&mut world);
+        assert!(
+            world.bodies[box_body].is_sleeping(),
+            "removing the hook flag woke the box (collisions_last = {collisions_last})"
+        );
+
+        world.bodies[box_body].wake_up(true);
+        advance(&mut world);
+        world.bodies[box_body].linvel().y
+    };
+
+    let dt = new_world().integration_parameters.dt;
+    let stock = wake_step_velocity(false);
+    let collisions_last = wake_step_velocity(true);
+    assert!(
+        stock < -0.5 * G * dt,
+        "stock stepping: the box should start falling on the wake step (vy = {stock})"
+    );
+    assert_close(
+        collisions_last,
+        stock,
+        1.0e-3,
+        "collisions-last vertical velocity on the wake step, against stock stepping",
+    );
+}
+
+#[test]
+fn non_finite_adhesion_term_does_not_drop_the_finite_terms() {
+    // A ball under a hooked ceiling touches it at a single point, so its manifold's tangential
+    // extent is 0 and an infinite pressure gives an infinite * 0 = NaN pressure force. That term
+    // must add nothing while the finite force requested on the same manifold still applies: the
+    // run must be bit-identical to requesting the force alone.
+    struct ForceAndPressure {
+        collider: ColliderHandle,
+        pressure: Option<Real>,
+    }
+    impl PhysicsHooks for ForceAndPressure {
+        fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+            if context.collider1 == self.collider || context.collider2 == self.collider {
+                *context.adhesion_force = 30.0;
+                if let Some(pressure) = self.pressure {
+                    *context.adhesion_pressure = pressure;
+                }
+            }
+        }
+    }
+
+    let simulate = |pressure: Option<Real>| -> (Vec<u32>, Real) {
+        let mut world = new_world();
+        let ceiling_body = world.insert_body(RigidBodyBuilder::fixed());
+        let ceiling = world.insert_collider(
+            ColliderBuilder::cuboid(5.0, 0.5)
+                .translation(Vector::new(0.0, 0.5))
+                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+            Some(ceiling_body),
+        );
+        let (ball_body, _) = world.insert(
+            RigidBodyBuilder::dynamic().translation(Vector::new(0.0, -0.5)),
+            ColliderBuilder::ball(0.5),
+        );
+        let hook = ForceAndPressure {
+            collider: ceiling,
+            pressure,
+        };
+        run(&mut world, &hook, 120);
+        (body_bits(&world), world.bodies[ball_body].translation().y)
+    };
+
+    let (force_only, y) = simulate(None);
+    assert!(
+        y > -0.6,
+        "the 30 N force alone should hold the ball (y = {y})"
+    );
+    for pressure in [Real::INFINITY, Real::NAN, Real::NEG_INFINITY] {
+        assert!(
+            simulate(Some(pressure)).0 == force_only,
+            "a pressure of {pressure} on a point contact changed the result of the finite force"
+        );
+    }
+}
+
+#[test]
+fn positive_infinite_requests_are_bit_identical_to_no_request() {
+    // A non-finite request adds nothing, +inf included: each kind alone, and all three together,
+    // match a hook that requests nothing, bit for bit.
+    struct Inert;
+    impl PhysicsHooks for Inert {
+        fn modify_solver_contacts(&self, _: &mut ContactModificationContext) {}
+    }
+    struct Infinite {
+        force: bool,
+        pressure: bool,
+        budget: bool,
+    }
+    impl PhysicsHooks for Infinite {
+        fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+            if self.force {
+                *context.adhesion_force = Real::INFINITY;
+            }
+            if self.pressure {
+                *context.adhesion_pressure = Real::INFINITY;
+            }
+            if self.budget {
+                *context.adhesion_budget = Some(AdhesionBudget {
+                    owner: context.collider1,
+                    channel: 7,
+                    total: Real::INFINITY,
+                });
+            }
+        }
+    }
+
+    let simulate = |hooks: &dyn PhysicsHooks| -> Vec<u32> {
+        let mut world = new_world();
+        ceiling_and_hanging_box_at(&mut world, 0.0);
+        slope_and_capsule(&mut world, Slope::Tiles);
+        run(&mut world, hooks, 90);
+        body_bits(&world)
+    };
+
+    let reference = simulate(&Inert);
+    for (force, pressure, budget) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        let hook = Infinite {
+            force,
+            pressure,
+            budget,
+        };
+        assert!(
+            simulate(&hook) == reference,
+            "an infinite request (force {force}, pressure {pressure}, budget {budget}) changed \
+             the simulation"
+        );
+    }
 }

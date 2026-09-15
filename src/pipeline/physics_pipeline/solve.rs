@@ -421,6 +421,12 @@ const ADHESION_BUDGET_MIN_WEIGHT: Real = 1.0e-3;
 /// Scratch adhesion budget pools: `((owner, channel), (pool total, sum of member weights))`.
 pub(super) type AdhesionPools = Vec<((ColliderHandle, u32), (Real, Real))>;
 
+/// Whether an adhesion value counts: positive and finite. A non-finite request adds nothing.
+#[inline]
+fn adhesion_term_applies(value: Real) -> bool {
+    value > 0.0 && value.is_finite()
+}
+
 /// Applies the adhesion requested through `PhysicsHooks::modify_solver_contacts` (stored on each
 /// manifold by the narrow phase) as external forces on the bodies, right before the contact
 /// solver reads them ("Design A": the unchanged push-only contacts then produce the holding
@@ -436,8 +442,11 @@ pub(super) type AdhesionPools = Vec<((ColliderHandle, u32), (Real, Real))>;
 /// parallel builds and survives snapshots. Serial; the first pass builds the budget pools and
 /// returns early when nothing requests adhesion.
 ///
-/// For each manifold with `k` solver contacts, the magnitude
-/// `F = max(force, 0) + max(pressure, 0) · extent + pool_total · weight / pool_weight_sum`
+/// For each manifold with `k` solver contacts, the magnitude `F` is the sum of those of the terms
+/// `force`, `pressure · extent` and `pool_total · weight / pool_weight_sum` that are positive and
+/// finite. A non-finite term adds nothing and doesn't discard the other terms of its manifold, and a
+/// budget whose total is not positive and finite joins no pool. A manifold whose `F` is not positive
+/// and finite (nothing requested, or an overflowing sum) writes nothing. Otherwise `F`
 /// is split into `k` equal forces `f = normal · F / k`, one per solver contact: `+f` on the
 /// first body and `-f` on the second (the normal points from collider1 toward collider2, so
 /// this pulls them together), each with the torque of the solver's own frozen lever arm
@@ -470,7 +479,7 @@ fn apply_contact_adhesion(
         }
         any_request |= data.adhesion_force > 0.0 || data.adhesion_pressure > 0.0;
         if let Some(budget) = &data.adhesion_budget {
-            if budget.total > 0.0 {
+            if adhesion_term_applies(budget.total) {
                 any_request = true;
                 let key = (budget.owner, budget.channel);
                 let weight = data.adhesion_extent.max(ADHESION_BUDGET_MIN_WEIGHT);
@@ -496,24 +505,32 @@ fn apply_contact_adhesion(
             continue;
         }
 
-        let mut magnitude = data.adhesion_force.max(0.0);
-        let pressure = data.adhesion_pressure.max(0.0);
-        if pressure > 0.0 {
-            magnitude += pressure * data.adhesion_extent;
+        // Each term counts on its own, only if it is positive and finite, so a non-finite request
+        // (an infinite pressure on a zero extent is NaN) can't discard a valid term.
+        let mut magnitude: Real = 0.0;
+        if adhesion_term_applies(data.adhesion_force) {
+            magnitude += data.adhesion_force;
+        }
+        let pressure_force = data.adhesion_pressure * data.adhesion_extent;
+        if adhesion_term_applies(pressure_force) {
+            magnitude += pressure_force;
         }
         if let Some(budget) = &data.adhesion_budget {
-            if budget.total > 0.0 {
+            if adhesion_term_applies(budget.total) {
                 let key = (budget.owner, budget.channel);
                 if let Some((_, (total, weight_sum))) = pools.iter().find(|(k, _)| *k == key) {
                     let weight = data.adhesion_extent.max(ADHESION_BUDGET_MIN_WEIGHT);
                     // This manifold's share; the shares of a pool sum to its total.
-                    magnitude += (*total / *weight_sum) * weight;
+                    let share = (*total / *weight_sum) * weight;
+                    if adhesion_term_applies(share) {
+                        magnitude += share;
+                    }
                 }
             }
         }
-        // Nothing requested (or a non-finite product): write nothing, so stock results stay
+        // Nothing requested (or an overflowing sum): write nothing, so stock results stay
         // bit-identical.
-        if magnitude.is_nan() || magnitude <= 0.0 {
+        if !adhesion_term_applies(magnitude) {
             continue;
         }
 
