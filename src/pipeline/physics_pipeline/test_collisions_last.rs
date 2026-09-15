@@ -246,33 +246,58 @@ fn step_collisions_last_matches_step() {
 
 /// Adds a body and a joint between collisions-last steps. In 0.32 this panicked with an
 /// out-of-bounds index in `select_active_interactions`, because the new body was not
-/// processed by the user-changes stage before the solve.
+/// processed by the user-changes stage before the solve. The joint must also act from the step of
+/// its insertion on: the new body, which the joint swings 5.4 m, must follow the path it follows
+/// with stock `step` (bit-identical when this was written).
 fn check_joint_added_between_steps(manual_init: bool) {
-    let mut world = PhysicsWorld::new();
-    let fixed_body = world.insert_body(RigidBodyBuilder::fixed());
-    world.insert(
-        RigidBodyBuilder::dynamic().translation(v(0.0, 5.0)),
-        ColliderBuilder::ball(0.5),
-    );
-    if manual_init {
-        world.initialize_collisions_last_with_events(&(), &());
+    let new_body_path = |collisions_last: bool| {
+        let mut world = PhysicsWorld::new();
+        let fixed_body = world.insert_body(RigidBodyBuilder::fixed());
+        world.insert(
+            RigidBodyBuilder::dynamic().translation(v(0.0, 5.0)),
+            ColliderBuilder::ball(0.5),
+        );
+        let step = |world: &mut PhysicsWorld| {
+            if collisions_last {
+                world.step_collisions_last();
+            } else {
+                world.step();
+            }
+        };
+        if collisions_last && manual_init {
+            world.initialize_collisions_last_with_events(&(), &());
+        }
+
+        for _ in 0..10 {
+            step(&mut world);
+        }
+
+        let (new_body, _) = world.insert(
+            RigidBodyBuilder::dynamic().translation(v(2.0, 5.0)),
+            ColliderBuilder::ball(0.5),
+        );
+        world.insert_impulse_joint(fixed_body, new_body, revolute());
+
+        let mut path = Vec::new();
+        for _ in 0..10 {
+            step(&mut world);
+            path.push(world.bodies[new_body].translation());
+        }
+
+        assert_all_bodies_finite(&world);
+        path
+    };
+
+    let last = new_body_path(true);
+    let stock = new_body_path(false);
+    for (i, (last, stock)) in last.iter().zip(&stock).enumerate() {
+        assert!(
+            (*last - *stock).length() <= 1.0e-4,
+            "the new body moved differently from stock stepping {} step(s) after the joint \
+             insertion: collisions-last {last:?}, stock {stock:?}",
+            i + 1
+        );
     }
-
-    for _ in 0..10 {
-        world.step_collisions_last();
-    }
-
-    let (new_body, _) = world.insert(
-        RigidBodyBuilder::dynamic().translation(v(2.0, 5.0)),
-        ColliderBuilder::ball(0.5),
-    );
-    world.insert_impulse_joint(fixed_body, new_body, revolute());
-
-    for _ in 0..10 {
-        world.step_collisions_last();
-    }
-
-    assert_all_bodies_finite(&world);
 }
 
 #[test]
@@ -652,7 +677,15 @@ fn manual_init_is_idempotent() {
 /// changes recolor and relink pairs in the narrow-phase and invalidate stored contacts, so
 /// they run through the catch-up detection; the debug validators of the solver graph and the
 /// persistent islands check the result each step. The same edits applied to a stock-stepped
-/// world must lead to the same pairs once things settle.
+/// world must lead to the same collision events, the same body positions (within 1e-4 m; they were
+/// bit-identical when this was written) and, once things settle, the same pairs.
+///
+/// The collision events are compared detection by detection. Stock `step` detects at the start of
+/// each step and collisions-last at the end of the previous one, at the same poses, so what stock
+/// step `k` emits, collisions-last emits during step `k - 1` (its initialization included, for
+/// `k = 0`). An edit made before step `k` is only seen by stock step `k` and by the catch-up
+/// detection of collisions-last step `k`, so the events of an edit step are compared together
+/// with those of the next step. The events of one detection are compared in sorted order.
 #[test]
 fn step_collisions_last_reparent_body_type_and_sensor_toggle() {
     struct Scene {
@@ -664,23 +697,33 @@ fn step_collisions_last_reparent_body_type_and_sensor_toggle() {
         extra: ColliderHandle,
     }
 
+    const EDIT_STEPS: [usize; 5] = [20, 30, 40, 50, 52];
+    let events = ActiveEvents::COLLISION_EVENTS;
     let scene = || {
         let mut world = PhysicsWorld::new();
-        world.insert(RigidBodyBuilder::fixed(), cuboid(10.0, 0.1));
+        world.insert(
+            RigidBodyBuilder::fixed(),
+            cuboid(10.0, 0.1).active_events(events),
+        );
         let (box_a, box_a_co) = world.insert(
             RigidBodyBuilder::dynamic().translation(v(-2.0, 0.6)),
-            cuboid(0.5, 0.5),
+            cuboid(0.5, 0.5).active_events(events),
         );
         let (box_b, _) = world.insert(
             RigidBodyBuilder::dynamic().translation(v(2.0, 0.6)),
-            cuboid(0.5, 0.5),
+            cuboid(0.5, 0.5).active_events(events),
         );
         let (ball, _) = world.insert(
             RigidBodyBuilder::dynamic().translation(v(0.0, 0.6)),
-            ColliderBuilder::ball(0.5),
+            ColliderBuilder::ball(0.5).active_events(events),
         );
         // Sits on top of box A (same parent: no contact), and moves to box B.
-        let extra = world.insert_collider(cuboid(0.25, 0.25).translation(v(0.0, 0.8)), Some(box_a));
+        let extra = world.insert_collider(
+            cuboid(0.25, 0.25)
+                .translation(v(0.0, 0.8))
+                .active_events(events),
+            Some(box_a),
+        );
         Scene {
             world,
             box_a,
@@ -709,13 +752,43 @@ fn step_collisions_last_reparent_body_type_and_sensor_toggle() {
 
     let mut stock = scene();
     let mut last = scene();
+    let (stock_log, last_log) = (CollisionLog::default(), CollisionLog::default());
+    let (mut stock_events, mut last_events) = (Vec::new(), Vec::new());
+    let mut compared_events = 0;
     for step in 0..120 {
         edit(&mut stock, step);
-        stock.world.step();
+        stock.world.step_with_events(&(), &stock_log);
+        stock_events.extend(stock_log.take());
+        if step > 0 && !EDIT_STEPS.contains(&step) {
+            stock_events.sort_unstable();
+            last_events.sort_unstable();
+            assert_eq!(
+                last_events, stock_events,
+                "collisions-last (left) and stock stepping (right) emitted different collision \
+                 events for the detections up to stock step {step}"
+            );
+            compared_events += stock_events.len();
+            stock_events.clear();
+            last_events.clear();
+        }
+
         edit(&mut last, step);
-        last.world.step_collisions_last();
+        last.world.step_collisions_last_with_events(&(), &last_log);
+        last_events.extend(last_log.take());
         assert_all_bodies_finite(&last.world);
         assert_no_stale_pairs(&last.world);
+
+        for body in [last.box_a, last.box_b, last.ball] {
+            let (last_pos, stock_pos) = (
+                last.world.bodies[body].translation(),
+                stock.world.bodies[body].translation(),
+            );
+            assert!(
+                (last_pos - stock_pos).length() <= 1.0e-4,
+                "body {body:?} is at {last_pos:?} with collisions-last but at {stock_pos:?} with \
+                 stock stepping, after step {step}"
+            );
+        }
 
         if step == 21 {
             // The re-parented collider moved with its new body.
@@ -729,13 +802,13 @@ fn step_collisions_last_reparent_body_type_and_sensor_toggle() {
             );
         }
     }
+    assert!(compared_events > 0, "the scene emitted no collision events");
 
     assert_eq!(
         pair_state(&last.world),
         pair_state(&stock.world),
         "collisions-last and stock stepping disagree on the settled pairs"
     );
-    let _ = last.box_a;
 }
 
 /// `max_ccd_substeps = 4`, a fast CCD body, and colliders removed between steps. The removals
@@ -787,6 +860,92 @@ fn step_collisions_last_ccd_substeps_with_removal() {
             "the broad-phase should hold exactly one leaf per live collider"
         );
         world.step_collisions_last();
+    }
+}
+
+/// `max_ccd_substeps = 4`, a fast CCD bullet, and two colliders in its path removed between steps,
+/// each right before the bullet sweeps through the space it occupied: a fixed collider, then a
+/// dynamic body. A removal doesn't trigger the catch-up detection, so the broad-phase still holds
+/// the removed collider's leaf during that step's CCD sweeps (it drops it in the next detection).
+/// The bullet must not collide with those ghosts: step for step, it must move as in the same scene
+/// without the two colliders (identically when this was written), with as many CCD substeps.
+#[test]
+fn step_collisions_last_ccd_ignores_colliders_removed_between_steps() {
+    let simulate = |with_ghosts: bool| {
+        let mut world = PhysicsWorld::new();
+        world.gravity = Vector::ZERO;
+        world.integration_parameters.max_ccd_substeps = 4;
+
+        // The wall's face is at x = 4.9.
+        world.insert_collider(cuboid(0.1, 5.0).translation(v(5.0, 0.0)), None);
+        // Straddling the bullet's path at x = 0 and x = 2.5.
+        let ghosts = with_ghosts.then(|| {
+            let fixed = world.insert_collider(cuboid(0.5, 0.5), None);
+            let (body, _) = world.insert(
+                RigidBodyBuilder::dynamic().translation(v(2.5, 0.0)),
+                cuboid(0.3, 0.3),
+            );
+            (fixed, body)
+        });
+        // 200 m/s: about 3.3 m per step from x = -5, so it crosses x = 0 during step 1 and
+        // x = 2.5 during step 2, where it reaches the wall.
+        let (bullet, _) = world.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(v(-5.0, 0.0))
+                .linvel(v(200.0, 0.0))
+                .ccd_enabled(true),
+            ColliderBuilder::ball(0.2),
+        );
+
+        let mut trace = Vec::new();
+        for step in 0..6 {
+            if let Some((fixed, body)) = ghosts {
+                match step {
+                    1 => {
+                        world.remove_collider(fixed);
+                    }
+                    2 => {
+                        world.remove_body(body);
+                    }
+                    _ => {}
+                }
+                if step == 1 || step == 2 {
+                    assert_eq!(
+                        world.broad_phase.tree.leaf_count() as usize,
+                        world.colliders.len() + 1,
+                        "the removed collider's leaf should stay in the broad-phase until the next \
+                         detection"
+                    );
+                }
+            }
+            world.step_collisions_last();
+            assert_all_bodies_finite(&world);
+            assert_no_stale_pairs(&world);
+            let rb = &world.bodies[bullet];
+            trace.push((
+                rb.translation(),
+                rb.linvel(),
+                world.physics_pipeline.counters.ccd.num_substeps,
+            ));
+        }
+        trace
+    };
+
+    let control = simulate(false);
+    let ghosts = simulate(true);
+    assert!(
+        control[1].0.x > 0.7 && control[2].2 > 1,
+        "the bullet should pass x = 0.7 during step 1, and hit the wall in CCD substeps during step \
+         2: {control:?}"
+    );
+    for (step, (ghost, control)) in ghosts.iter().zip(&control).enumerate() {
+        assert!(
+            ghost.2 == control.2
+                && (ghost.0 - control.0).length() <= 1.0e-5
+                && (ghost.1 - control.1).length() <= 1.0e-5,
+            "step {step}: the bullet collided with a removed collider (position, velocity, CCD \
+             substeps with the removed colliders: {ghost:?}; without them: {control:?})"
+        );
     }
 }
 
