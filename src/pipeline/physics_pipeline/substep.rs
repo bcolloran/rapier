@@ -345,6 +345,16 @@ impl PhysicsPipeline {
         self.counters.step_started();
         self.quarantine.clear();
 
+        // Collisions-last: whether an impulse or multibody joint was inserted or removed since the
+        // last step, read before the user-change stage drains these lists. A joint can disable the
+        // contacts between its bodies (and a multibody filters the contacts between its links),
+        // which the stored contacts don't reflect, so such a step catches up (see below).
+        let joints_changed = mode == StepMode::CollisionsLast
+            && !(impulse_joints.to_join.is_empty()
+                && impulse_joints.island_events.is_empty()
+                && multibody_joints.to_join.is_empty()
+                && multibody_joints.island_chain_events.is_empty());
+
         // Apply some of delayed wake-ups.
         self.counters.stages.user_changes.start();
         #[cfg(feature = "enhanced-determinism")]
@@ -443,8 +453,10 @@ impl PhysicsPipeline {
         }
 
         // Collisions-last defers the detection to the end of the step, unless a user change
-        // invalidated the contacts the solve would use: then it catches up here, like `Standard`.
+        // invalidated the contacts the solve would use (a collider change outside the deferrable
+        // set, or a joint inserted or removed): then it catches up here, like `Standard`.
         let defer_detection = mode == StepMode::CollisionsLast
+            && !joints_changed
             && !modified_colliders.iter().any(|handle| {
                 colliders.get(*handle).is_some_and(|co| {
                     !co.changes

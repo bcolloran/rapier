@@ -1521,3 +1521,131 @@ fn step_collisions_last_wake_after_sleep() {
     check_wake_after_sleep(3);
     check_wake_after_sleep(1);
 }
+
+/// Two dynamic boxes overlapping by 0.1 m in zero gravity, and a fixed joint with contacts disabled
+/// between them (an impulse joint, or a multibody link), either inserted or removed between two
+/// steps:
+/// - `insert`: after one step, whose contact starts pushing the boxes apart, the joint is inserted,
+///   holding them where they are.
+/// - otherwise: the joint holds them overlapping from the start, so they have no contact, and it
+///   is removed after three steps.
+///
+/// Returns the boxes' relative speed after the next step, and how far that step moved them
+/// relative to each other.
+///
+/// Contact recycling is off: a recycled pair keeps its contacts without checking the joints between
+/// its bodies until its next full update, in both stepping modes.
+fn relative_motion_after_joint_change(
+    collisions_last: bool,
+    multibody: bool,
+    insert: bool,
+) -> (Real, Real) {
+    let mut world = PhysicsWorld::new();
+    world.gravity = Vector::ZERO;
+    world.integration_parameters.contact_recycling = false;
+    let (a, _) = world.insert(RigidBodyBuilder::dynamic(), cuboid(0.5, 0.5));
+    let (b, _) = world.insert(
+        RigidBodyBuilder::dynamic().translation(v(0.9, 0.0)),
+        cuboid(0.5, 0.5),
+    );
+    let step = |world: &mut PhysicsWorld| {
+        if collisions_last {
+            world.step_collisions_last();
+        } else {
+            world.step();
+        }
+    };
+    let offset =
+        |world: &PhysicsWorld| world.bodies[b].translation() - world.bodies[a].translation();
+    let touching = |world: &PhysicsWorld| {
+        world
+            .contact_pairs()
+            .any(|pair| pair.has_any_active_contact())
+    };
+    let joint = |anchor: Vector| {
+        FixedJointBuilder::new()
+            .local_anchor1(anchor)
+            .contacts_enabled(false)
+    };
+
+    if insert {
+        step(&mut world);
+        assert!(
+            touching(&world),
+            "the boxes should touch before the insertion"
+        );
+        let joint = joint(offset(&world));
+        if multibody {
+            world
+                .insert_multibody_joint(a, b, joint)
+                .expect("the multibody link should be valid");
+        } else {
+            world.insert_impulse_joint(a, b, joint);
+        }
+    } else {
+        let joint = joint(offset(&world));
+        let multibody_link = if multibody {
+            world.insert_multibody_joint(a, b, joint)
+        } else {
+            world.insert_impulse_joint(a, b, joint);
+            None
+        };
+        for _ in 0..3 {
+            step(&mut world);
+        }
+        assert!(
+            !touching(&world),
+            "the joint should disable the contacts before its removal"
+        );
+        match multibody_link {
+            Some(handle) => world.remove_multibody_joint(handle),
+            None => {
+                let (handle, _) = world.impulse_joints().next().unwrap();
+                world.remove_impulse_joint(handle);
+            }
+        }
+    }
+
+    let before = offset(&world);
+    step(&mut world);
+    let speed = (world.bodies[b].linvel() - world.bodies[a].linvel()).length();
+    let moved = (offset(&world) - before).length();
+    (speed, moved)
+}
+
+/// A joint inserted or removed between touching bodies changes which contacts the solve may use,
+/// but it is not a collider change. Stock `step` applies it in the detection that precedes the
+/// solve. Collisions-last must catch up for it too: otherwise the step after an insertion solves
+/// the contact and the joint together (the contact pushes the boxes apart against the joint), and
+/// the step after a removal solves the overlapping boxes without their contact.
+#[test]
+fn step_collisions_last_catches_up_on_joint_insertion_and_removal() {
+    let mut mismatches = Vec::new();
+    for insert in [true, false] {
+        for multibody in [false, true] {
+            let change = match (insert, multibody) {
+                (true, false) => "impulse joint inserted",
+                (true, true) => "multibody link inserted",
+                (false, false) => "impulse joint removed",
+                (false, true) => "multibody link removed",
+            };
+            let (stock_speed, stock_moved) =
+                relative_motion_after_joint_change(false, multibody, insert);
+            let (last_speed, last_moved) =
+                relative_motion_after_joint_change(true, multibody, insert);
+            if (last_speed - stock_speed).abs() > 1.0e-5
+                || (last_moved - stock_moved).abs() > 1.0e-5
+            {
+                mismatches.push(alloc::format!(
+                    "{change}: collisions-last {last_speed:e} m/s relative speed, moved \
+                     {last_moved:e} m; stock {stock_speed:e} m/s, moved {stock_moved:e} m"
+                ));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "the step after a joint change differs from stock stepping:\n{}",
+        mismatches.join("\n")
+    );
+}
