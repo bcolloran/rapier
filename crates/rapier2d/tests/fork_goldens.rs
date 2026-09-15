@@ -33,8 +33,19 @@ const HOOKED_GOLDEN: u64 = 0x81bf_32df_72af_2aa3;
 const MIXED_COLLISIONS_LAST_GOLDEN: u64 = 0x4775_892b_f8fb_3ba5;
 const HOOKED_COLLISIONS_LAST_GOLDEN: u64 = 0x227f_63a7_ada0_9894;
 
+/// FNV-1a digests of `adhesion_scene` stepped with stock `step` and with collisions-last, minted
+/// when the cross-feature adhesion tests were added to the 0.35.3 port. They guard adhesion
+/// (force, pressure and budget requests, next to a `tangent_velocity` drive) in both stepping
+/// modes, including a sleeping adhered body woken by a contact, which collisions-last repairs with
+/// `requalify_woken_pair_hints`. Do not re-mint them to make an unrelated change pass.
+const ADHESION_GOLDEN: u64 = 0x6e4a_65bc_9cec_227b;
+const ADHESION_COLLISIONS_LAST_GOLDEN: u64 = 0x7e99_f424_1119_e917;
+
 const MIXED_STEPS: usize = 60;
 const HOOKED_STEPS: usize = 240;
+const ADHESION_STEPS: usize = 360;
+/// The step before which a ball is thrown at the (by then sleeping) box under the ceiling.
+const ADHESION_WAKE_STEP: usize = 240;
 
 struct Fnv(u64);
 
@@ -283,6 +294,283 @@ fn hooked_scene() -> (PhysicsWorld, DriveHook) {
     (world, hooks)
 }
 
+/// An adhesion request of `AdhesionHook`.
+#[derive(Clone, Copy)]
+enum Request {
+    Force(Real),
+    Pressure(Real),
+    Budget(Real),
+}
+
+/// Requests adhesion on the manifolds of the listed colliders (when `enabled`), drives the
+/// `drive` capsules with a conveyor `tangent_velocity`, and counts its calls and the requests it
+/// made.
+struct AdhesionHook {
+    requests: Vec<(ColliderHandle, Request)>,
+    drive: Vec<ColliderHandle>,
+    enabled: bool,
+    calls: AtomicUsize,
+    requests_made: AtomicUsize,
+}
+
+impl PhysicsHooks for AdhesionHook {
+    fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if self.enabled {
+            for (collider, request) in &self.requests {
+                if context.collider1 != *collider && context.collider2 != *collider {
+                    continue;
+                }
+                self.requests_made.fetch_add(1, Ordering::Relaxed);
+                match *request {
+                    Request::Force(force) => *context.adhesion_force = force,
+                    Request::Pressure(pressure) => *context.adhesion_pressure = pressure,
+                    Request::Budget(total) => {
+                        *context.adhesion_budget = Some(AdhesionBudget {
+                            owner: *collider,
+                            channel: 0,
+                            total,
+                        })
+                    }
+                }
+            }
+        }
+        // `tangent_velocity` is the target velocity of collider2 relative to collider1.
+        let sign = if self.drive.contains(&context.collider2) {
+            1.0
+        } else if self.drive.contains(&context.collider1) {
+            -1.0
+        } else {
+            return;
+        };
+        for contact in context.solver_contacts.iter_mut() {
+            contact.tangent_velocity.x = sign * 1.5;
+        }
+    }
+}
+
+struct AdhesionScene {
+    world: PhysicsWorld,
+    hooks: AdhesionHook,
+    /// The boxes adhered to the monolithic slope and to the tiled slope (force, pressure, budget).
+    slope_boxes: [RigidBodyHandle; 3],
+    /// The box adhered under the ceiling, asleep by `ADHESION_WAKE_STEP`.
+    hanging_box: RigidBodyHandle,
+}
+
+/// Boxes adhered to a monolithic slope and to a slope of abutting tiles, which their friction
+/// alone can't hold them on; a box adhered under a ceiling; capsules driven along the floor. The
+/// adhered boxes and the capsules report collision and contact-force events. With `adhesion`
+/// false, the hook requests nothing (the control run of the scene).
+fn adhesion_scene(adhesion: bool) -> AdhesionScene {
+    let mut world = PhysicsWorld::new();
+    world.gravity = Vector::new(0.0, -9.81);
+    let events = ActiveEvents::COLLISION_EVENTS | ActiveEvents::CONTACT_FORCE_EVENTS;
+    let hooked = ActiveHooks::MODIFY_SOLVER_CONTACTS;
+
+    // A 0.5 rad slope: friction 0.3 holds up to tan(0.3) ~= 0.29 rad.
+    let theta: Real = 0.5;
+    let up_slope = Vector::new(theta.cos(), theta.sin());
+    let normal = Vector::new(-theta.sin(), theta.cos());
+
+    world.insert(
+        RigidBodyBuilder::fixed().translation(Vector::new(0.0, -0.5)),
+        ColliderBuilder::cuboid(40.0, 0.5),
+    );
+    let statics = world.insert_body(RigidBodyBuilder::fixed());
+    let monolithic = Vector::new(-12.0, 3.0);
+    world.insert_collider(
+        ColliderBuilder::cuboid(5.0, 0.25)
+            .translation(monolithic)
+            .rotation(theta)
+            .friction(0.3),
+        Some(statics),
+    );
+    let tiled = Vector::new(12.0, 3.0);
+    for k in 0..10 {
+        world.insert_collider(
+            ColliderBuilder::cuboid(0.5, 0.25)
+                .translation(tiled + up_slope * (k as Real - 4.5))
+                .rotation(theta)
+                .friction(0.3),
+            Some(statics),
+        );
+    }
+    let ceiling = world.insert_collider(
+        ColliderBuilder::cuboid(3.0, 0.5)
+            .translation(Vector::new(0.0, 8.0))
+            .active_hooks(hooked),
+        Some(statics),
+    );
+
+    // A box resting on a slope, `along` meters up from its center.
+    let mut slope_box = |world: &mut PhysicsWorld, center: Vector, along: Real| {
+        world.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(center + up_slope * along + normal * 0.75)
+                .rotation(theta),
+            ColliderBuilder::cuboid(0.5, 0.5)
+                .friction(0.3)
+                .active_hooks(hooked)
+                .active_events(events)
+                .contact_force_event_threshold(1.0),
+        )
+    };
+    let (force_box, force_box_co) = slope_box(&mut world, monolithic, 1.0);
+    // Both straddle a seam between two tiles.
+    let (pressure_box, pressure_box_co) = slope_box(&mut world, tiled, -2.0);
+    let (budget_box, budget_box_co) = slope_box(&mut world, tiled, 2.0);
+
+    let (hanging_box, _) = world.insert(
+        RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 7.0)),
+        ColliderBuilder::cuboid(0.5, 0.5),
+    );
+
+    let mut drive = Vec::new();
+    for i in 0..3 {
+        let (_, capsule) = world.insert(
+            RigidBodyBuilder::dynamic().translation(Vector::new(-4.0 + 2.5 * i as Real, 0.55)),
+            ColliderBuilder::capsule_y(0.3, 0.25)
+                .friction(0.8)
+                .active_hooks(hooked)
+                .active_events(events)
+                .contact_force_event_threshold(5.0),
+        );
+        drive.push(capsule);
+    }
+
+    let hooks = AdhesionHook {
+        requests: vec![
+            (force_box_co, Request::Force(25.0)),
+            (pressure_box_co, Request::Pressure(25.0)),
+            (budget_box_co, Request::Budget(25.0)),
+            (ceiling, Request::Force(30.0)),
+        ],
+        drive,
+        enabled: adhesion,
+        calls: AtomicUsize::new(0),
+        requests_made: AtomicUsize::new(0),
+    };
+    AdhesionScene {
+        world,
+        hooks,
+        slope_boxes: [force_box, pressure_box, budget_box],
+        hanging_box,
+    }
+}
+
+/// What a run of `adhesion_scene` produced.
+struct AdhesionRun {
+    digest: u64,
+    counts: [usize; 4],
+    calls: usize,
+    requests_made: usize,
+    /// How far each slope box moved.
+    slope_box_travel: [Real; 3],
+    /// Whether the hanging box slept right before the ball was thrown, and woke up afterwards.
+    asleep_before_wake: bool,
+    woke_after: bool,
+}
+
+fn run_adhesion_scene(collisions_last: bool, adhesion: bool) -> AdhesionRun {
+    let AdhesionScene {
+        mut world,
+        hooks,
+        slope_boxes,
+        hanging_box,
+    } = adhesion_scene(adhesion);
+    let log = EventLog::default();
+    let mut fnv = Fnv::new();
+    let mut counts = [0; 4];
+    let starts = slope_boxes.map(|h| world.bodies[h].translation());
+    if collisions_last {
+        world.initialize_collisions_last_with_events(&hooks, &log);
+        log.digest_step(&mut fnv, &mut counts);
+    }
+    let (mut asleep_before_wake, mut woke_after) = (false, false);
+    for step in 0..ADHESION_STEPS {
+        if step == ADHESION_WAKE_STEP {
+            asleep_before_wake = world.bodies[hanging_box].is_sleeping();
+            world.insert(
+                RigidBodyBuilder::dynamic()
+                    .translation(Vector::new(-3.0, 7.0))
+                    .linvel(Vector::new(8.0, 0.0))
+                    .gravity_scale(0.0),
+                ColliderBuilder::ball(0.25),
+            );
+        }
+        if collisions_last {
+            world.step_collisions_last_with_events(&hooks, &log);
+        } else {
+            world.step_with_events(&hooks, &log);
+        }
+        log.digest_step(&mut fnv, &mut counts);
+        if step >= ADHESION_WAKE_STEP {
+            woke_after |= !world.bodies[hanging_box].is_sleeping();
+        }
+    }
+    digest_world(&world, &mut fnv);
+    let mut slope_box_travel = [0.0; 3];
+    for (i, h) in slope_boxes.iter().enumerate() {
+        slope_box_travel[i] = (world.bodies[*h].translation() - starts[i]).length();
+    }
+    AdhesionRun {
+        digest: fnv.0,
+        counts,
+        calls: hooks.calls.load(Ordering::Relaxed),
+        requests_made: hooks.requests_made.load(Ordering::Relaxed),
+        slope_box_travel,
+        asleep_before_wake,
+        woke_after,
+    }
+}
+
+/// Checks that an adhesion-scene run exercised what its golden guards, against the same scene
+/// with the adhesion turned off. When the goldens were minted, in both modes: the hook made 225
+/// or 226 requests, the slope boxes moved at most 0.36 mm with adhesion and slid 4.4 to 8.8 m
+/// without it, and the events were 9 collision starts, 1 stop and 267 contact-force events.
+fn check_adhesion_scene_exercised(name: &str, run: &AdhesionRun, control: &AdhesionRun) {
+    assert!(
+        run.calls > 0 && run.requests_made > 0,
+        "{name} never requested adhesion (hook calls {}, requests {})",
+        run.calls,
+        run.requests_made
+    );
+    assert!(
+        run.counts[0] > 0 && run.counts[2] > 0 && run.counts[3] > 0,
+        "{name} is missing collision or contact-force events: {:?}",
+        run.counts
+    );
+    for (i, (held, slid)) in run
+        .slope_box_travel
+        .iter()
+        .zip(&control.slope_box_travel)
+        .enumerate()
+    {
+        assert!(
+            *held < 0.01 && *slid > 1.0,
+            "{name}: slope box {i} should stay put with adhesion and slide down without it \
+             (moved {held} m with adhesion, {slid} m without)"
+        );
+    }
+    assert!(
+        run.asleep_before_wake && run.woke_after,
+        "{name}: the box under the ceiling should sleep until the ball is thrown, then wake up \
+         (asleep {}, woke {})",
+        run.asleep_before_wake,
+        run.woke_after
+    );
+}
+
+fn check_adhesion(name: &str, got: u64, golden: u64) {
+    assert_eq!(
+        got, golden,
+        "\n{name}: adhesion results differ from the fork golden.\n  golden: {golden:#018x}\n  \
+         got:    {got:#018x}\nA change altered adhesion in this stepping mode. Do not re-mint this \
+         golden to make an unrelated change pass.\n",
+    );
+}
+
 fn check(name: &str, got: u64, golden: u64) {
     assert_eq!(
         got, golden,
@@ -393,5 +681,25 @@ fn hooked_scene_collisions_last_matches_fork_golden() {
         "hooked_scene_collisions_last",
         fnv.0,
         HOOKED_COLLISIONS_LAST_GOLDEN,
+    );
+}
+
+#[test]
+fn adhesion_scene_matches_fork_golden() {
+    let run = run_adhesion_scene(false, true);
+    let control = run_adhesion_scene(false, false);
+    check_adhesion_scene_exercised("adhesion_scene", &run, &control);
+    check_adhesion("adhesion_scene", run.digest, ADHESION_GOLDEN);
+}
+
+#[test]
+fn adhesion_scene_collisions_last_matches_fork_golden() {
+    let run = run_adhesion_scene(true, true);
+    let control = run_adhesion_scene(true, false);
+    check_adhesion_scene_exercised("adhesion_scene_collisions_last", &run, &control);
+    check_adhesion(
+        "adhesion_scene_collisions_last",
+        run.digest,
+        ADHESION_COLLISIONS_LAST_GOLDEN,
     );
 }
