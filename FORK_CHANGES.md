@@ -260,16 +260,32 @@ limit. Bound sums still scale with the manifold count, and the 2×2 block solver
     rollback does.
 - **Collisions-last only:** editing an existing joint, such as its `contacts_enabled` flag, triggers
   no catch-up, so the edit reaches the contacts one step late.
-- **Cost:** `requalify_woken_pair_hints` walks every edge of every awake body each step. Catch-up
-  frames (for example any frame that spawns a collider) run collision detection twice. The
-  benchmark's "Spawner" scene measures this.
+- **Cost:** collisions-last does extra work each step.
+  - `requalify_woken_pair_hints` walks every edge of every awake body.
+  - Every step runs an end-of-step solver-graph maintenance.
+  - Catch-up frames (for example any frame that spawns a collider) run collision detection twice.
+
+  **Measured on 2026-09-14** with `collisions_last_bench.rs`: 500 A/B-alternated iterations per
+  scene, release build, on a loaded 32-core machine (load average ~8). `step_collisions_last` was
+  **1–7% slower per step** than `step`, with nearly the same results under default and game
+  features.
+  - Stress scenes: +3.6% to +6.5% (Balls, Boxes, Capsules, Pyramid, Heightfield, Vertical stacks,
+    Convex polygons).
+  - Joint scenes: +0.8% to +2.7%.
+  - Spawner: +6.1% to +6.9%.
+  - Adhesion tiles: +2.7% (~0.003 ms, not significant).
+
+  The June 2026 measurement on 0.32 showed no consistent overhead. The extra per-step work above is
+  the likely cause, but it has not been profiled.
 
 ## 6c. Open decisions
 
 1. **Stock `step` adhesion sweep.** Worlds without hooks pay one read per solver-active manifold
    per substep. Removing that cost needs a sticky, serialized "adhesion requested" flag, because
-   sleeping and requalified pairs keep old requests without the hook running again. Keep the sweep
-   (simple, measured by the benchmark), or add the flag?
+   sleeping and requalified pairs keep old requests without the hook running again. The A/B
+   benchmark does not isolate this cost: both of its worlds run the fork. Measuring it means
+   comparing the fork's `step` with upstream `d90dd956`. Keep the sweep, or measure and add the
+   flag?
 2. **Verification tooling.** `port-gates.sh` and the cargo shim live outside the repo. Commit them
    under `scripts/fork/`, so the next upgrade starts with them, or keep them outside?
 
