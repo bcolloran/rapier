@@ -28,3 +28,6 @@ build/
 .ruff_cache/
 .venv/
 venv/
+
+# step vs step_collisions_last benchmark output (fork)
+benchmark_summary.txt
