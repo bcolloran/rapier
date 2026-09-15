@@ -59,12 +59,6 @@ fn add_sticky_surface(
 }
 
 pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
-    // Step with `step_collisions_last` (the game's stepping mode) instead of `step`. Changing it
-    // restarts the example, so both modes start from the same scene.
-    let collisions_last = viewer
-        .example_settings_mut()
-        .get_or_set_bool("Collisions last", true);
-
     let mut world = PhysicsWorld::new();
     world.gravity = Vector::new(0.0, -9.81);
     let mut sticky = Vec::new();
@@ -134,18 +128,11 @@ pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     viewer.set_world(&mut world);
     viewer.look_at(Vec2::new(2.0, 2.0), 18.0);
 
-    // After `set_world`, which replaces the broad-phase.
-    if collisions_last {
-        world.initialize_collisions_last_with_events(&physics_hooks, &());
-    }
-
     while viewer.render_frame(&mut world).await {
         if viewer.simulating() {
-            if collisions_last {
-                world.step_collisions_last_with_events(&physics_hooks, &());
-            } else {
-                world.step_with_events(&physics_hooks, &());
-            }
+            // Detects collisions last when Settings > Advanced > "Collisions last" is checked
+            // (`set_world` applies it to `world.collisions_last`).
+            world.step_with_events(&physics_hooks, &());
         }
     }
     Ok(())

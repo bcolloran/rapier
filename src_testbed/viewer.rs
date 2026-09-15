@@ -199,10 +199,15 @@ impl TestbedViewer {
     // ───────────────────────── scene registration ───────────────────────────
 
     /// Registers render nodes for the world the example just built, configures the selected
-    /// broad-phase, and enables the profiling counters. Render-node creation is deferred to
-    /// the next frame so example code can still set initial colors after calling this.
+    /// broad-phase and stepping order (Settings > Advanced > "Collisions last"), and enables the
+    /// profiling counters. Render-node creation is deferred to the next frame so example code can
+    /// still set initial colors after calling this.
     pub fn set_world(&mut self, world: &mut PhysicsWorld) {
         world.broad_phase = self.state.broad_phase_type.init_broad_phase();
+        world.collisions_last = self
+            .state
+            .flags
+            .contains(TestbedStateFlags::COLLISIONS_LAST);
         world.physics_pipeline.counters.enable();
 
         // Dedicated physics pool of `cores - 1` threads capped at 8: leave a core for the

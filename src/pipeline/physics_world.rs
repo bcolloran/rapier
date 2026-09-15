@@ -85,6 +85,15 @@ pub struct PhysicsWorld {
     /// Workspace only: not part of a snapshot (see the type docs).
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     pub ccd_solver: CCDSolver,
+    /// Whether [`step`](Self::step) and [`step_with_events`](Self::step_with_events) detect
+    /// collisions at the end of the step ([`PhysicsPipeline::step_collisions_last`]) instead of
+    /// at the start ([`PhysicsPipeline::step`]). Defaults to `false`.
+    ///
+    /// It can be changed between steps: after a stock step, the next collisions-last step runs
+    /// its initial collision detection again at the current poses. Like `physics_pipeline`, it is
+    /// not part of a snapshot.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub collisions_last: bool,
 }
 
 impl Default for PhysicsWorld {
@@ -101,6 +110,7 @@ impl Default for PhysicsWorld {
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
+            collisions_last: false,
         }
     }
 }
@@ -138,7 +148,14 @@ impl PhysicsWorld {
     ///     println!("Collision event: {:?}", event);
     /// }
     /// ```
+    ///
+    /// When [`collisions_last`](Self::collisions_last) is set, this steps with
+    /// [`step_collisions_last_with_events`](Self::step_collisions_last_with_events) instead.
     pub fn step_with_events(&mut self, hooks: &dyn PhysicsHooks, events: &dyn EventHandler) {
+        if self.collisions_last {
+            self.step_collisions_last_with_events(hooks, events);
+            return;
+        }
         self.physics_pipeline.step(
             self.gravity,
             &self.integration_parameters,

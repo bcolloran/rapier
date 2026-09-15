@@ -526,6 +526,25 @@ fn settings_tab(
             }
         });
 
+        // Stepping order
+        let mut collisions_last = state.flags.contains(TestbedStateFlags::COLLISIONS_LAST);
+        if ui
+            .checkbox(&mut collisions_last, "Collisions last")
+            .on_hover_text(
+                "Detect collisions at the end of each step (step_collisions_last) instead of at \
+                 the start, so contacts and collision events match the new body poses between \
+                 steps. Changing it restarts the example.",
+            )
+            .changed()
+        {
+            state
+                .flags
+                .set(TestbedStateFlags::COLLISIONS_LAST, collisions_last);
+            world.collisions_last = collisions_last;
+            state.preserve_settings_on_switch = true;
+            state.transition = Some(Transition::Switch);
+        }
+
         ui.add(
             Slider::new(&mut integration_parameters.max_ccd_substeps, 0..=10).text("CCD substeps"),
         )

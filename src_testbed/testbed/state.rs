@@ -41,6 +41,9 @@ bitflags! {
         const WIREFRAME = 1 << 8;
         const STATISTICS = 1 << 9;
         const DRAW_SURFACES = 1 << 10;
+        /// Step the examples with collision detection at the end of the step
+        /// (`PhysicsWorld::collisions_last`).
+        const COLLISIONS_LAST = 1 << 11;
     }
 }
 

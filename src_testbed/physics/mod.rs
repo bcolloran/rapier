@@ -46,6 +46,8 @@ pub fn restore_world(world: &mut PhysicsWorld, snapshot: &PhysicsSnapshot) -> us
         impulse_joints,
         multibody_joints,
         ccd_solver: _,
+        // The stepping order is a testbed setting, not part of the snapshot: keep the current one.
+        collisions_last: _,
     } = restored;
     world.gravity = gravity;
     world.integration_parameters = integration_parameters;

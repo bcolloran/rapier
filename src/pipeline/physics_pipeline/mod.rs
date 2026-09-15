@@ -219,6 +219,11 @@ impl PhysicsPipeline {
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
     ) {
+        // After this step the narrow-phase holds the contacts of the start-of-step poses, not the
+        // end-of-step ones a collisions-last solve expects: a later `step_collisions_last` must
+        // run its initial collision detection again.
+        self.collisions_last_initialized = false;
+
         // With a dedicated pool configured, run the whole step inside it.
         #[cfg(all(feature = "parallel", not(feature = "unsync-callbacks")))]
         if let Some(pool) = self.thread_pool.clone() {
@@ -272,7 +277,9 @@ impl PhysicsPipeline {
     /// method yourself if you need to read collision data at t=0, before the first step.
     ///
     /// This method has the same signature as [`step`](Self::step) and can be used as a drop-in
-    /// replacement. Use one or the other for a given simulation, not both.
+    /// replacement. A simulation can also switch between the two. A call to `step` clears the
+    /// [initialized flag](Self::collisions_last_initialized), so the next call to this method
+    /// runs the initial collision detection again at the current poses.
     ///
     /// # User changes between steps
     ///
@@ -448,8 +455,8 @@ impl PhysicsPipeline {
     ///
     /// [`step_collisions_last`](Self::step_collisions_last) calls this automatically on its
     /// first call, so you only need it to read collision data before stepping. It runs once:
-    /// calling it again, or after the first `step_collisions_last`, does nothing (see
-    /// [`collisions_last_initialized`](Self::collisions_last_initialized)).
+    /// calling it again, or after the first `step_collisions_last`, does nothing until the next
+    /// [`step`](Self::step) (see [`collisions_last_initialized`](Self::collisions_last_initialized)).
     ///
     /// `ccd_solver` is needed because the user changes applied here (for example inserted or
     /// removed fixed colliders) must invalidate its cached list of fixed targets.
@@ -519,6 +526,10 @@ impl PhysicsPipeline {
     /// on this pipeline, either through
     /// [`initialize_collisions_last`](Self::initialize_collisions_last) or through the first
     /// call to [`step_collisions_last`](Self::step_collisions_last).
+    ///
+    /// A call to [`step`](Self::step) clears it. After a stock step the narrow-phase holds the
+    /// contacts of the start-of-step poses, so the next `step_collisions_last` runs the
+    /// initialization again.
     pub fn collisions_last_initialized(&self) -> bool {
         self.collisions_last_initialized
     }

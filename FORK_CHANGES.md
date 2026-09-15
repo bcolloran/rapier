@@ -28,6 +28,12 @@ Companion API:
   divergence.
 - `PhysicsWorld::{step_collisions_last, step_collisions_last_with_events,
   initialize_collisions_last_with_events}`.
+- `PhysicsWorld::collisions_last: bool` (default `false`, not serialized). When it is set,
+  `PhysicsWorld::step` and `step_with_events` detect collisions at the end of the step. The
+  testbed's Settings → Advanced → "Collisions last" checkbox sets it for every example.
+- A stock `PhysicsPipeline::step` clears the initialized flag. So a simulation that switches from
+  `step` back to `step_collisions_last` re-runs the initial detection at the current poses, instead
+  of solving with the contacts of the start-of-step poses.
 
 **Why.** The game reads contacts between ticks, for movement and jump logic. With stock `step`,
 those contacts describe the poses at the start of the tick, so they are one tick stale.
@@ -185,8 +191,11 @@ limit. Bound sums still scale with the manifold count, and the 2×2 block solver
 ## 3. Tooling
 
 - **Demos:** `examples2d/adhesion{,_grid,_curved,_climb,_slide,_teeter}2.rs`, in the "Adhesion"
-  group of `all_examples2`. Each has a "Collisions last" setting, on by default. Run them with
+  group of `all_examples2`. Run them with
   `cargo run --release -p rapier-examples-2d --bin all_examples2`.
+- **Testbed stepping order:** Settings → Advanced → "Collisions last" steps every example with
+  `step_collisions_last`, through `PhysicsWorld::collisions_last`. It is off by default, is saved
+  with the other testbed settings, and restarts the example when changed.
 - **Benchmark:** `crates/rapier2d/tests/collisions_last_bench.rs`, an ignored A/B timing test with
   Welch's t-test.
   - Scenes: the ten June 2026 stress scenes, "Adhesion tiles" (game-shaped), and "Spawner" (a
@@ -228,8 +237,8 @@ limit. Bound sums still scale with the manifold count, and the 2×2 block solver
   is true on the step a pair's total force first exceeds its threshold, and resets when the force
   drops back below it or the pair separates.
 - The testbed capsule-coloring fix is upstream (`set_color_recursive`).
-- The per-example toggle and `collisions_last_bench.rs` replace the testbed's
-  `Harness::use_step_collisions_last` flag and the `app.rs` benchmark.
+- The testbed's Settings → Advanced → "Collisions last" checkbox and `collisions_last_bench.rs`
+  replace the testbed's `Harness::use_step_collisions_last` flag and the `app.rs` benchmark.
 - `StepMode` replaces the public stage helpers `user_changes_stage_part_1/2`, `substeps_stage` and
   `update_mass_properties_of_moved_bodies_stage`.
 
@@ -239,7 +248,9 @@ limit. Bound sums still scale with the manifold count, and the 2×2 block solver
    (see §1) detect twice, so hooks run twice on them.
 2. In collisions-last mode, new colliders get contacts before that step's solve, and a woken island
    solves with its resting contacts. On 0.32 both were one step late.
-3. `initialize_collisions_last` takes `ccd_solver`, and there is a new initialized-flag setter.
+3. `initialize_collisions_last` takes `ccd_solver`, and there is a new initialized-flag setter. A
+   stock `step` clears the initialized flag, so switching back to `step_collisions_last`
+   initializes again.
 4. `ContactManifoldData::tangential_extent()` returns the value cached when the hook ran.
 5. Adhesion is not applied to a dominance-world-attached side. 0.32 applied it to any dynamic body.
 6. Infinite adhesion requests now add nothing. 0.32 applied an infinite force.
