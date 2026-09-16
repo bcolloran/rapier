@@ -7,7 +7,6 @@ use crate::dynamics::{
     CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet,
     RigidBodyChanges, RigidBodySet, RigidBodyType,
 };
-#[cfg(feature = "parallel")]
 use crate::geometry::ColliderHandle;
 use crate::geometry::{
     BroadPhaseBvh, ColliderChanges, ColliderSet, ModifiedColliders, NarrowPhase,
@@ -261,26 +260,31 @@ impl PhysicsPipeline {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn step_inner(
+    /// Starts a step (counters, quarantine reports).
+    fn begin_step(&mut self) {
+        self.counters.reset();
+        self.counters.step_started();
+        self.quarantine.clear();
+    }
+
+    /// Applies the changes the user made since the last step (deferred wake-ups,
+    /// quarantine of non-finite user state, collider and rigid-body modifications, joint
+    /// island edits, multibody forward kinematics).
+    ///
+    /// Returns the lists of modified colliders, removed colliders and modified bodies taken
+    /// from the sets. The caller hands them to the collision detection, clears them with
+    /// [`Self::clear_user_changes`], and gives the collider list back to the set with
+    /// [`Self::end_step`].
+    #[allow(clippy::type_complexity)]
+    fn handle_user_changes(
         &mut self,
-        gravity: Vector,
-        integration_parameters: &IntegrationParameters,
         islands: &mut IslandManager,
-        broad_phase: &mut BroadPhaseBvh,
-        narrow_phase: &mut NarrowPhase,
         bodies: &mut RigidBodySet,
         colliders: &mut ColliderSet,
         impulse_joints: &mut ImpulseJointSet,
         multibody_joints: &mut MultibodyJointSet,
         ccd_solver: &mut CCDSolver,
-        hooks: &dyn PhysicsHooks,
-        events: &dyn EventHandler,
-    ) {
-        self.counters.reset();
-        self.counters.step_started();
-        self.quarantine.clear();
-
+    ) -> (ModifiedColliders, Vec<ColliderHandle>, ModifiedRigidBodies) {
         // Apply some of delayed wake-ups.
         self.counters.stages.user_changes.start();
         #[cfg(feature = "enhanced-determinism")]
@@ -310,7 +314,7 @@ impl PhysicsPipeline {
             &modified_colliders[..],
         );
 
-        let mut modified_bodies = bodies.take_modified();
+        let modified_bodies = bodies.take_modified();
         crate::pipeline::user_changes::handle_user_changes_to_rigid_bodies(
             Some(islands),
             bodies,
@@ -378,28 +382,50 @@ impl PhysicsPipeline {
                 .update_rigid_bodies_internal(bodies, true, false, false);
         }
 
-        self.detect_collisions(
-            integration_parameters,
-            islands,
-            broad_phase,
-            narrow_phase,
-            bodies,
-            colliders,
-            impulse_joints,
-            multibody_joints,
-            &modified_colliders,
-            &removed_colliders,
-            hooks,
-            events,
-            true,
-        );
+        (modified_colliders, removed_colliders, modified_bodies)
+    }
 
+    /// Clears the change flags of the colliders and bodies modified by the user, and
+    /// empties the lists returned by [`Self::handle_user_changes`].
+    fn clear_user_changes(
+        &mut self,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        modified_colliders: &mut ModifiedColliders,
+        removed_colliders: &mut Vec<ColliderHandle>,
+        modified_bodies: &mut ModifiedRigidBodies,
+    ) {
         self.counters.stages.user_changes.resume();
-        self.clear_modified_colliders(colliders, &mut modified_colliders);
-        self.clear_modified_bodies(bodies, &mut modified_bodies);
+        self.clear_modified_colliders(colliders, modified_colliders);
+        self.clear_modified_bodies(bodies, modified_bodies);
         removed_colliders.clear();
         self.counters.stages.user_changes.pause();
+    }
 
+    /// Runs the substep loop. Each substep slices the timestep for CCD, interpolates the
+    /// kinematic velocities, builds the islands and solves the velocity constraints, clamps
+    /// the CCD motion, advances the bodies to their final positions and refreshes the
+    /// broad-phase AABBs, with a collision detection between CCD substeps.
+    ///
+    /// `modified_colliders` is the list returned by [`Self::handle_user_changes`]: the
+    /// detections between CCD substeps consume it.
+    #[allow(clippy::too_many_arguments)]
+    fn run_substeps(
+        &mut self,
+        gravity: Vector,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        modified_colliders: &mut ModifiedColliders,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
         let mut remaining_time = integration_parameters.dt;
         let mut integration_parameters = *integration_parameters;
 
@@ -544,14 +570,14 @@ impl PhysicsPipeline {
                     colliders,
                     impulse_joints,
                     multibody_joints,
-                    &modified_colliders,
+                    modified_colliders,
                     &[],
                     hooks,
                     events,
                     false,
                 );
 
-                self.clear_modified_colliders(colliders, &mut modified_colliders);
+                self.clear_modified_colliders(colliders, modified_colliders);
             } else {
                 // If we ran the last substep, just update the broad-phase bvh instead
                 // of a full collision-detection step. Internal motion doesn't go
@@ -564,7 +590,11 @@ impl PhysicsPipeline {
                 self.counters.stages.collision_detection_time.pause();
             }
         }
+    }
 
+    /// Ends a step: gives the modified-collider list back to the set and completes
+    /// the counters.
+    fn end_step(&mut self, colliders: &mut ColliderSet, modified_colliders: ModifiedColliders) {
         // Finally, make sure we update the world mass-properties of the rigid-bodies
         // that moved. Otherwise, users may end up applying forces with respect to an
         // outdated center of mass.
@@ -578,5 +608,77 @@ impl PhysicsPipeline {
         colliders.set_modified(modified_colliders);
 
         self.counters.step_completed();
+    }
+
+    /// One physics step: the stages of [`PhysicsPipeline::step`], in order.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn step_inner(
+        &mut self,
+        gravity: Vector,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.begin_step();
+
+        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
+            .handle_user_changes(
+                islands,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                ccd_solver,
+            );
+
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            true,
+        );
+
+        self.clear_user_changes(
+            bodies,
+            colliders,
+            &mut modified_colliders,
+            &mut removed_colliders,
+            &mut modified_bodies,
+        );
+
+        self.run_substeps(
+            gravity,
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            ccd_solver,
+            &mut modified_colliders,
+            hooks,
+            events,
+        );
+
+        self.end_step(colliders, modified_colliders);
     }
 }
