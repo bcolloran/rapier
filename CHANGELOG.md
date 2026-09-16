@@ -6,9 +6,12 @@
   `step_collisions_last_with_events`): a stepping order that solves and integrates first and
   detects collisions last, so that the narrow-phase describes the current poses between steps.
   It runs the same stages as `step` in a different order; with no changes between steps both
-  orders move the bodies identically; changes made between steps reach the contacts one step
-  late. `initialize_collisions_last` runs the initial detection, once before the first step.
-  `step` is unchanged.
+  orders move the bodies identically. A change made between steps that leaves the stored
+  contacts unusable (an inserted, enabled, disabled, reshaped, regrouped or re-parented
+  collider, a body type or dominance change, a woken body, an inserted or removed joint) makes
+  the step detect collisions before its solve too, as `step` does; other changes reach the
+  contacts one step late. `initialize_collisions_last` runs the initial detection, once
+  before the first step. `step` is unchanged.
 
 ## v0.35.3 (28 August 2026)
 

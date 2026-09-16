@@ -132,6 +132,13 @@ impl NarrowPhase {
         self.solver_graph_dirty.clear();
     }
 
+    /// The [`IslandManager::active_set_epoch`] the solver contact graph was last maintained
+    /// at: [`Self::maintain_solver_contact_graph`] leaves it equal to the island manager's, so
+    /// a different value there means the active set changed since (a wake-up, a body removal).
+    pub(crate) fn solver_graph_epoch(&self) -> u32 {
+        self.solver_graph_epoch
+    }
+
     /// Maintains the persistent per-color [`SolverContactGraph`]:
     /// full rebuild when the awake set shifts (epoch bump),
     /// else only this step's fully-updated pairs reconcile — unchanged manifolds keep their slots.

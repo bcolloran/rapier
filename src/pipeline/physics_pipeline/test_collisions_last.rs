@@ -2,9 +2,9 @@
 //! [`PhysicsPipeline::initialize_collisions_last`].
 //!
 //! The regression scenes of `test.rs`, stepped in that order; the changes made between steps
-//! (their narrow-phase half applied before the solve); CCD substeps; the deferred BVH
-//! optimization; snapshots; the bit-identity of both orders when nothing changes between steps;
-//! and the contact data matching the poses read between steps.
+//! (the narrow-phase half applied before the solve, the catch-up detection); CCD substeps; the
+//! deferred BVH optimization; snapshots; the bit-identity of both orders when nothing changes
+//! between steps; and the contact data matching the poses read between steps.
 
 use crate::alloc_prelude::*;
 use crate::math::{Real, Rotation, Vector};
@@ -1105,6 +1105,562 @@ fn initialize_collisions_last_after_stock_steps_snapshot_roundtrip() {
     assert!(
         force_events > 0,
         "the scene emitted no contact-force events"
+    );
+}
+
+/// A stack of `count` boxes resting on a fixed floor whose top is at `y = 0.1`, bottom box first.
+fn box_stack(count: usize) -> (PhysicsWorld, Vec<RigidBodyHandle>) {
+    let mut world = PhysicsWorld::new();
+    world.insert(RigidBodyBuilder::fixed(), cuboid(10.0, 0.1));
+    let boxes = (0..count)
+        .map(|i| {
+            world
+                .insert(
+                    RigidBodyBuilder::dynamic().translation(v(0.0, 0.6 + i as Real)),
+                    cuboid(0.5, 0.5),
+                )
+                .0
+        })
+        .collect();
+    (world, boxes)
+}
+
+/// Steps `world` (with `step`, or with `step_collisions_last`) until all `bodies` sleep.
+fn step_until_asleep(world: &mut PhysicsWorld, collisions_last: bool, bodies: &[RigidBodyHandle]) {
+    for _ in 0..3000 {
+        if collisions_last {
+            world.step_collisions_last();
+        } else {
+            world.step();
+        }
+        if bodies
+            .iter()
+            .all(|handle| world.bodies[*handle].is_sleeping())
+        {
+            return;
+        }
+    }
+    panic!("the bodies never fell asleep");
+}
+
+// The catch-up detection: changes that leave the stored contacts unusable.
+
+/// Re-parents a collider, changes a body type and toggles a sensor between steps. These
+/// changes recolor and relink pairs in the narrow-phase and invalidate stored contacts, so
+/// they run through the catch-up detection; the debug validators of the solver graph and the
+/// persistent islands check the result each step. The same edits applied to a standard-stepped
+/// world must lead to the same collision events, the same body positions (within 1e-4 m) and,
+/// once things settle, the same pairs.
+///
+/// The collision events are compared detection by detection. `step` detects at the start of
+/// each step and collisions-last at the end of the previous one, at the same poses, so what
+/// standard step `k` emits, collisions-last emits during step `k - 1` (its initialization
+/// included, for `k = 0`). An edit made before step `k` is only seen by standard step `k` and by
+/// the catch-up detection of collisions-last step `k`, so the events of an edit step are
+/// compared together with those of the next step. The events of one detection are compared in
+/// sorted order.
+#[test]
+fn step_collisions_last_reparent_body_type_and_sensor_toggle() {
+    struct Scene {
+        world: PhysicsWorld,
+        box_a: RigidBodyHandle,
+        box_a_co: ColliderHandle,
+        box_b: RigidBodyHandle,
+        ball: RigidBodyHandle,
+        extra: ColliderHandle,
+    }
+
+    const EDIT_STEPS: [usize; 5] = [20, 30, 40, 50, 52];
+    let events = ActiveEvents::COLLISION_EVENTS;
+    let scene = || {
+        let mut world = PhysicsWorld::new();
+        world.insert(
+            RigidBodyBuilder::fixed(),
+            cuboid(10.0, 0.1).active_events(events),
+        );
+        let (box_a, box_a_co) = world.insert(
+            RigidBodyBuilder::dynamic().translation(v(-2.0, 0.6)),
+            cuboid(0.5, 0.5).active_events(events),
+        );
+        let (box_b, _) = world.insert(
+            RigidBodyBuilder::dynamic().translation(v(2.0, 0.6)),
+            cuboid(0.5, 0.5).active_events(events),
+        );
+        let (ball, _) = world.insert(
+            RigidBodyBuilder::dynamic().translation(v(0.0, 0.6)),
+            ColliderBuilder::ball(0.5).active_events(events),
+        );
+        // Sits on top of box A (same parent: no contact), and moves to box B.
+        let extra = world.insert_collider(
+            cuboid(0.25, 0.25)
+                .translation(v(0.0, 0.8))
+                .active_events(events),
+            Some(box_a),
+        );
+        Scene {
+            world,
+            box_a,
+            box_a_co,
+            box_b,
+            ball,
+            extra,
+        }
+    };
+
+    let edit = |scene: &mut Scene, step: usize| {
+        let world = &mut scene.world;
+        match step {
+            20 => world
+                .colliders
+                .set_parent(scene.extra, Some(scene.box_b), &mut world.bodies),
+            30 => {
+                world.bodies[scene.ball].set_body_type(RigidBodyType::KinematicPositionBased, true)
+            }
+            40 => world.bodies[scene.ball].set_body_type(RigidBodyType::Dynamic, true),
+            50 => world.colliders[scene.box_a_co].set_sensor(true),
+            52 => world.colliders[scene.box_a_co].set_sensor(false),
+            _ => {}
+        }
+    };
+
+    let mut standard = scene();
+    let mut last = scene();
+    let (standard_log, last_log) = (CollisionLog::default(), CollisionLog::default());
+    last.world
+        .initialize_collisions_last_with_events(&(), &last_log);
+    let (mut standard_events, mut last_events) = (Vec::new(), Vec::new());
+    let mut compared_events = 0;
+    for step in 0..120 {
+        edit(&mut standard, step);
+        standard.world.step_with_events(&(), &standard_log);
+        standard_events.extend(standard_log.take());
+        if step > 0 && !EDIT_STEPS.contains(&step) {
+            standard_events.sort_unstable();
+            last_events.sort_unstable();
+            assert_eq!(
+                last_events, standard_events,
+                "collisions-last (left) and standard stepping (right) emitted different collision \
+                 events for the detections up to standard step {step}"
+            );
+            compared_events += standard_events.len();
+            standard_events.clear();
+            last_events.clear();
+        }
+
+        edit(&mut last, step);
+        last.world.step_collisions_last_with_events(&(), &last_log);
+        last_events.extend(last_log.take());
+        assert_all_bodies_finite(&last.world);
+        assert_no_stale_pairs(&last.world);
+
+        for body in [last.box_a, last.box_b, last.ball] {
+            let (last_pos, standard_pos) = (
+                last.world.bodies[body].translation(),
+                standard.world.bodies[body].translation(),
+            );
+            assert!(
+                (last_pos - standard_pos).length() <= 1.0e-4,
+                "body {body:?} is at {last_pos:?} with collisions-last but at {standard_pos:?} with \
+                 standard stepping, after step {step}"
+            );
+        }
+
+        if step == 21 {
+            // The re-parented collider moved with its new body.
+            assert_eq!(last.world.colliders[last.extra].parent(), Some(last.box_b));
+        }
+        if step == 51 {
+            let (_, intersecting) = pair_state(&last.world);
+            assert!(
+                !intersecting.is_empty(),
+                "the box turned into a sensor should intersect the floor"
+            );
+        }
+    }
+    assert!(compared_events > 0, "the scene emitted no collision events");
+
+    assert_eq!(
+        pair_state(&last.world),
+        pair_state(&standard.world),
+        "collisions-last and standard stepping disagree on the settled pairs"
+    );
+}
+
+/// Counts `modify_solver_contacts` calls.
+#[derive(Default)]
+struct HookCalls(core::sync::atomic::AtomicUsize);
+
+impl HookCalls {
+    fn take(&self) -> usize {
+        self.0.swap(0, core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl PhysicsHooks for HookCalls {
+    fn modify_solver_contacts(&self, _: &mut ContactModificationContext) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Inserting a collider triggers the catch-up detection, so collision detection runs twice on
+/// that step (the contact hook runs twice), but the collision events are not duplicated: the
+/// per-pair event sequence matches standard stepping.
+#[test]
+fn step_collisions_last_catch_up_does_not_duplicate_collision_events() {
+    const INSERT_STEP: usize = 10;
+    let events = ActiveEvents::COLLISION_EVENTS;
+
+    let scene = || {
+        let mut world = PhysicsWorld::new();
+        world.insert(
+            RigidBodyBuilder::fixed(),
+            cuboid(10.0, 0.1).active_events(events),
+        );
+        // Resting on the floor (top at y = 1.1).
+        world.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(v(0.0, 0.6))
+                .can_sleep(false),
+            cuboid(0.5, 0.5).active_events(events),
+        );
+        world
+    };
+    // Slightly overlapping the box, so their contact starts during the insertion step.
+    let insert = |world: &mut PhysicsWorld| {
+        world.insert(
+            RigidBodyBuilder::dynamic().translation(v(0.0, 1.38)),
+            ColliderBuilder::ball(0.3)
+                .active_events(events)
+                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+        )
+    };
+
+    let (mut standard, mut last) = (scene(), scene());
+    let (standard_log, last_log) = (CollisionLog::default(), CollisionLog::default());
+    let (standard_hooks, last_hooks) = (HookCalls::default(), HookCalls::default());
+    last.initialize_collisions_last_with_events(&last_hooks, &last_log);
+    let (mut standard_events, mut last_events) = (Vec::new(), Vec::new());
+    let mut ball_co = None;
+
+    for step in 0..60 {
+        if step == INSERT_STEP {
+            insert(&mut standard);
+            ball_co = Some(insert(&mut last).1.into_raw_parts().0);
+        }
+        standard.step_with_events(&standard_hooks, &standard_log);
+        last.step_collisions_last_with_events(&last_hooks, &last_log);
+
+        let step_events = last_log.take();
+        let (standard_calls, last_calls) = (standard_hooks.take(), last_hooks.take());
+        if step == INSERT_STEP {
+            let ball_co = ball_co.unwrap();
+            let ball_starts = step_events
+                .iter()
+                .filter(|(started, a, b)| *started && (*a == ball_co || *b == ball_co))
+                .count();
+            assert_eq!(
+                ball_starts, 1,
+                "the inserted ball's contact should start exactly once: {step_events:?}"
+            );
+            assert!(
+                last_calls > 0 && last_calls == 2 * standard_calls,
+                "the insertion step should run the contact hook for both detections: \
+                 collisions-last {last_calls}, standard {standard_calls}"
+            );
+        }
+        standard_events.extend(standard_log.take());
+        last_events.extend(step_events);
+    }
+
+    // Per pair, the event sequence alternates started/stopped, and matches standard stepping.
+    let per_pair = |events: &[(bool, u32, u32)]| {
+        let mut pairs: Vec<((u32, u32), Vec<bool>)> = Vec::new();
+        for (started, a, b) in events {
+            match pairs.iter_mut().find(|(pair, _)| *pair == (*a, *b)) {
+                Some((_, sequence)) => sequence.push(*started),
+                None => pairs.push(((*a, *b), alloc::vec![*started])),
+            }
+        }
+        pairs.sort_unstable();
+        pairs
+    };
+    let last_pairs = per_pair(&last_events);
+    for (pair, sequence) in &last_pairs {
+        for (i, started) in sequence.iter().enumerate() {
+            assert_eq!(
+                *started,
+                i % 2 == 0,
+                "pair {pair:?} has a duplicated collision event: {sequence:?}"
+            );
+        }
+    }
+    assert_eq!(
+        last_pairs.len(),
+        2,
+        "expected box-floor and ball-box events"
+    );
+    assert_eq!(last_pairs, per_pair(&standard_events));
+}
+
+/// Wakes the top box of a sleeping stack between steps, in twin scenes stepped with `step`
+/// and with collisions-last. Falling asleep cleared the solver selection of the stack's pairs:
+/// standard stepping restores it in the detection that precedes the solve, and the wake-up makes
+/// collisions-last detect before its solve as well (a catch-up). Without it, the woken stack
+/// would be solved for one step without its resting contacts and sink under gravity. The twin
+/// stacks settled identically and must go on identically: every box keeps the same height in
+/// both, bit for bit.
+fn check_wake_after_sleep(count: usize) {
+    let (mut standard, standard_boxes) = box_stack(count);
+    let (mut last, last_boxes) = box_stack(count);
+    last.initialize_collisions_last();
+    step_until_asleep(&mut standard, false, &standard_boxes);
+    step_until_asleep(&mut last, true, &last_boxes);
+
+    let (standard_top, last_top) = (*standard_boxes.last().unwrap(), *last_boxes.last().unwrap());
+    standard.wake_up(standard_top, true);
+    last.wake_up(last_top, true);
+    assert!(last_boxes.iter().all(|h| !last.bodies[*h].is_sleeping()));
+    assert_heights_match(&mut standard, &standard_boxes, &mut last, &last_boxes);
+}
+
+/// Steps `standard` with `step` and `last` with `step_collisions_last` ten times, asserting
+/// after each step that every body of `standard_bodies` has the same height, bit for bit, as
+/// its twin in `last_bodies`.
+fn assert_heights_match(
+    standard: &mut PhysicsWorld,
+    standard_bodies: &[RigidBodyHandle],
+    last: &mut PhysicsWorld,
+    last_bodies: &[RigidBodyHandle],
+) {
+    for step in 0..10 {
+        standard.step();
+        last.step_collisions_last();
+        for (i, (a, b)) in standard_bodies.iter().zip(last_bodies).enumerate() {
+            let standard_y = standard.bodies[*a].translation().y;
+            let last_y = last.bodies[*b].translation().y;
+            assert!(
+                last_y == standard_y,
+                "body {i} is at {last_y} with collisions-last but at {standard_y} with standard \
+                 stepping, {} step(s) after the change",
+                step + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn step_collisions_last_wake_after_sleep() {
+    check_wake_after_sleep(3);
+    check_wake_after_sleep(1);
+}
+
+/// Edits an impulse joint of a sleeping pair of boxes with `wake_up_connected_bodies`. The joint
+/// set queues the wake-up and the user-changes stage applies it, so it must trigger the
+/// catch-up like a direct wake-up does.
+#[test]
+fn step_collisions_last_wake_after_sleep_by_joint_edit() {
+    let scene = || {
+        let (mut world, boxes) = box_stack(2);
+        let joint = world.insert_impulse_joint(
+            boxes[0],
+            boxes[1],
+            revolute()
+                .local_anchor1(v(0.0, 0.5))
+                .local_anchor2(v(0.0, -0.5)),
+        );
+        (world, boxes, joint)
+    };
+    let (mut standard, standard_boxes, standard_joint) = scene();
+    let (mut last, last_boxes, last_joint) = scene();
+    last.initialize_collisions_last();
+    step_until_asleep(&mut standard, false, &standard_boxes);
+    step_until_asleep(&mut last, true, &last_boxes);
+
+    standard.impulse_joints.get_mut(standard_joint, true);
+    last.impulse_joints.get_mut(last_joint, true);
+    assert_heights_match(&mut standard, &standard_boxes, &mut last, &last_boxes);
+}
+
+/// Moves the fixed collider a sleeping box rests on, sideways, by editing the collider's
+/// position: a deferred change on its own, but the narrow-phase wakes the bodies touching a
+/// modified collider, and the woken box must be solved with its contact.
+#[test]
+fn step_collisions_last_wake_after_sleep_by_moved_collider() {
+    let scene = || {
+        let mut world = PhysicsWorld::new();
+        let floor = world.insert_collider(cuboid(10.0, 0.1), None);
+        let (body, _) = world.insert(
+            RigidBodyBuilder::dynamic().translation(v(0.0, 0.6)),
+            cuboid(0.5, 0.5),
+        );
+        (world, floor, body)
+    };
+    let (mut standard, standard_floor, standard_box) = scene();
+    let (mut last, last_floor, last_box) = scene();
+    last.initialize_collisions_last();
+    step_until_asleep(&mut standard, false, &[standard_box]);
+    step_until_asleep(&mut last, true, &[last_box]);
+
+    standard.colliders[standard_floor].set_translation(v(0.1, 0.0));
+    last.colliders[last_floor].set_translation(v(0.1, 0.0));
+    assert_heights_match(&mut standard, &[standard_box], &mut last, &[last_box]);
+}
+
+/// Moves a fixed body a sleeping box is attached to by a slack spring, without waking it. The
+/// user-changes stage wakes the joint partners of a moved fixed body, and the woken box must be
+/// solved with its resting contact.
+#[test]
+fn step_collisions_last_wake_after_sleep_by_moved_fixed_joint_partner() {
+    let scene = || {
+        let mut world = PhysicsWorld::new();
+        world.insert(RigidBodyBuilder::fixed(), cuboid(10.0, 0.1));
+        let (body, _) = world.insert(
+            RigidBodyBuilder::dynamic().translation(v(0.0, 0.6)),
+            cuboid(0.5, 0.5),
+        );
+        let anchor = world.insert_body(RigidBodyBuilder::fixed().translation(v(0.0, 3.0)));
+        world.insert_impulse_joint(anchor, body, SpringJointBuilder::new(2.4, 0.0, 0.0));
+        (world, anchor, body)
+    };
+    let (mut standard, standard_anchor, standard_box) = scene();
+    let (mut last, last_anchor, last_box) = scene();
+    last.initialize_collisions_last();
+    step_until_asleep(&mut standard, false, &[standard_box]);
+    step_until_asleep(&mut last, true, &[last_box]);
+
+    standard.bodies[standard_anchor].set_translation(v(0.1, 3.0), false);
+    last.bodies[last_anchor].set_translation(v(0.1, 3.0), false);
+    assert_heights_match(&mut standard, &[standard_box], &mut last, &[last_box]);
+}
+
+/// Two dynamic boxes overlapping by 0.1 m in zero gravity, and a fixed joint with contacts disabled
+/// between them (an impulse joint, or a multibody link), either inserted or removed between two
+/// steps:
+/// - `insert`: after one step, whose contact starts pushing the boxes apart, the joint is inserted,
+///   holding them where they are.
+/// - otherwise: the joint holds them overlapping from the start, so they have no contact, and it
+///   is removed after three steps.
+///
+/// Returns the boxes' relative speed after the next step, and how far that step moved them
+/// relative to each other.
+///
+/// Contact recycling is off: a recycled pair keeps its contacts without checking the joints between
+/// its bodies until its next full update, in both stepping modes.
+fn relative_motion_after_joint_change(
+    collisions_last: bool,
+    multibody: bool,
+    insert: bool,
+) -> (Real, Real) {
+    let mut world = PhysicsWorld::new();
+    world.gravity = Vector::ZERO;
+    world.integration_parameters.contact_recycling = false;
+    let (a, _) = world.insert(RigidBodyBuilder::dynamic(), cuboid(0.5, 0.5));
+    let (b, _) = world.insert(
+        RigidBodyBuilder::dynamic().translation(v(0.9, 0.0)),
+        cuboid(0.5, 0.5),
+    );
+    if collisions_last {
+        world.initialize_collisions_last();
+    }
+    let step = |world: &mut PhysicsWorld| {
+        if collisions_last {
+            world.step_collisions_last();
+        } else {
+            world.step();
+        }
+    };
+    let offset =
+        |world: &PhysicsWorld| world.bodies[b].translation() - world.bodies[a].translation();
+    let touching = |world: &PhysicsWorld| {
+        world
+            .contact_pairs()
+            .any(|pair| pair.has_any_active_contact())
+    };
+    let joint = |anchor: Vector| {
+        FixedJointBuilder::new()
+            .local_anchor1(anchor)
+            .contacts_enabled(false)
+    };
+
+    if insert {
+        step(&mut world);
+        assert!(
+            touching(&world),
+            "the boxes should touch before the insertion"
+        );
+        let joint = joint(offset(&world));
+        if multibody {
+            world
+                .insert_multibody_joint(a, b, joint)
+                .expect("the multibody link should be valid");
+        } else {
+            world.insert_impulse_joint(a, b, joint);
+        }
+    } else {
+        let joint = joint(offset(&world));
+        let multibody_link = if multibody {
+            world.insert_multibody_joint(a, b, joint)
+        } else {
+            world.insert_impulse_joint(a, b, joint);
+            None
+        };
+        for _ in 0..3 {
+            step(&mut world);
+        }
+        assert!(
+            !touching(&world),
+            "the joint should disable the contacts before its removal"
+        );
+        match multibody_link {
+            Some(handle) => world.remove_multibody_joint(handle),
+            None => {
+                let (handle, _) = world.impulse_joints().next().unwrap();
+                world.remove_impulse_joint(handle);
+            }
+        }
+    }
+
+    let before = offset(&world);
+    step(&mut world);
+    let speed = (world.bodies[b].linvel() - world.bodies[a].linvel()).length();
+    let moved = (offset(&world) - before).length();
+    (speed, moved)
+}
+
+/// A joint inserted or removed between touching bodies changes which contacts the solve may use,
+/// but it is not a collider change. `step` applies it in the detection that precedes the
+/// solve. Collisions-last must catch up for it too: otherwise the step after an insertion solves
+/// the contact and the joint together (the contact pushes the boxes apart against the joint), and
+/// the step after a removal solves the overlapping boxes without their contact.
+#[test]
+fn step_collisions_last_catches_up_on_joint_insertion_and_removal() {
+    let mut mismatches = Vec::new();
+    for insert in [true, false] {
+        for multibody in [false, true] {
+            let change = match (insert, multibody) {
+                (true, false) => "impulse joint inserted",
+                (true, true) => "multibody link inserted",
+                (false, false) => "impulse joint removed",
+                (false, true) => "multibody link removed",
+            };
+            let (standard_speed, standard_moved) =
+                relative_motion_after_joint_change(false, multibody, insert);
+            let (last_speed, last_moved) =
+                relative_motion_after_joint_change(true, multibody, insert);
+            if (last_speed - standard_speed).abs() > 1.0e-5
+                || (last_moved - standard_moved).abs() > 1.0e-5
+            {
+                mismatches.push(alloc::format!(
+                    "{change}: collisions-last {last_speed:e} m/s relative speed, moved \
+                     {last_moved:e} m; standard {standard_speed:e} m/s, moved {standard_moved:e} m"
+                ));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "the step after a joint change differs from standard stepping:\n{}",
+        mismatches.join("\n")
     );
 }
 

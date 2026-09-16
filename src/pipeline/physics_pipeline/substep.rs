@@ -713,6 +713,64 @@ impl PhysicsPipeline {
         self.join_deferred_bvh_optimize(broad_phase);
     }
 
+    /// Whether the changes made since the last step leave the stored contacts unusable for the
+    /// solve of a collisions-last step, so that the step must detect collisions before its solve
+    /// too (as [`Self::step_inner`] does), and not only after it.
+    ///
+    /// Read before [`Self::handle_user_changes`] drains the pending lists it inspects.
+    /// A collider change the narrow-phase recycles a pair's contacts through (a move, a
+    /// mass-property change) is deferred to the end-of-step detection; any other one
+    /// (insertion, enabling or disabling, shape, groups, sensor status, parent) is not. A body
+    /// that changes type or dominance group, or is enabled or disabled, changes its colliders
+    /// the same way once the user changes are applied. A woken body must be solved with the
+    /// contacts it rested on, whose solver selection falling asleep cleared: a wake-up either
+    /// flags the body (`RigidBody::wake_up`), or is queued by the joint sets (a joint edited
+    /// with a wake-up), or changes the active set right away (`IslandManager::wake_up`, as a
+    /// body removal does), which moves the island manager's epoch away from the one the solver
+    /// contact graph was last maintained at. A moved fixed body wakes its joint partners once
+    /// the user changes are applied. An inserted or removed joint changes which contacts the
+    /// solve may use.
+    fn needs_catch_up_detection(
+        islands: &IslandManager,
+        narrow_phase: &NarrowPhase,
+        bodies: &RigidBodySet,
+        colliders: &ColliderSet,
+        impulse_joints: &ImpulseJointSet,
+        multibody_joints: &MultibodyJointSet,
+    ) -> bool {
+        // The same set as the narrow-phase's pair update recycles through.
+        let recycle_safe = ColliderChanges::IN_MODIFIED_SET
+            | ColliderChanges::POSITION
+            | ColliderChanges::LOCAL_MASS_PROPERTIES;
+        let body_catch_up = RigidBodyChanges::TYPE
+            | RigidBodyChanges::DOMINANCE
+            | RigidBodyChanges::ENABLED_OR_DISABLED
+            | RigidBodyChanges::SLEEP;
+
+        let joints_changed = !(impulse_joints.to_join.is_empty()
+            && impulse_joints.island_events.is_empty()
+            && impulse_joints.to_wake_up.is_empty()
+            && multibody_joints.to_join.is_empty()
+            && multibody_joints.island_chain_events.is_empty()
+            && multibody_joints.to_wake_up.is_empty());
+        joints_changed
+            || islands.active_set_epoch != narrow_phase.solver_graph_epoch()
+            || colliders.modified_colliders.iter().any(|handle| {
+                colliders
+                    .get(*handle)
+                    .is_some_and(|co| !co.changes.difference(recycle_safe).is_empty())
+            })
+            || bodies.modified_bodies.iter().any(|handle| {
+                bodies.get(*handle).is_some_and(|rb| {
+                    rb.changes.intersects(body_catch_up)
+                        || (rb.is_fixed()
+                            && rb.changes.contains(RigidBodyChanges::POSITION)
+                            && (impulse_joints.attached_joints(*handle).next().is_some()
+                                || multibody_joints.attached_joints(*handle).next().is_some()))
+                })
+            })
+    }
+
     /// One physics step with the collision detection last: the stages of
     /// [`PhysicsPipeline::step_collisions_last`], in order.
     ///
@@ -720,7 +778,9 @@ impl PhysicsPipeline {
     /// loop to after it, so the narrow-phase describes the poses the step ends with. The user
     /// changes are still applied before the solve, and so is their narrow-phase half (the pairs
     /// of removed colliders must not reach the island update and the solve); the detection at
-    /// the end applies their broad-phase half and recomputes the contacts.
+    /// the end applies their broad-phase half and recomputes the contacts. When the changes
+    /// leave the stored contacts unusable ([`Self::needs_catch_up_detection`]), the step
+    /// detects collisions before its solve as well, as `step_inner` does.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn step_collisions_last_inner(
         &mut self,
@@ -739,6 +799,15 @@ impl PhysicsPipeline {
     ) {
         self.begin_step();
 
+        let catch_up = Self::needs_catch_up_detection(
+            islands,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+        );
+
         let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
             .handle_user_changes(
                 islands,
@@ -749,21 +818,53 @@ impl PhysicsPipeline {
                 ccd_solver,
             );
 
-        // Apply the narrow-phase half of the changes here (the pairs of removed colliders must
-        // not reach the island update and the solve); the end-of-step detection applies their
-        // broad-phase half.
-        self.counters.stages.collision_detection_time.resume();
-        self.counters.cd.narrow_phase_time.resume();
-        narrow_phase.handle_user_changes(
-            Some(islands),
-            &modified_colliders,
-            &removed_colliders,
-            colliders,
-            bodies,
-            events,
-        );
-        self.counters.cd.narrow_phase_time.pause();
-        self.counters.stages.collision_detection_time.pause();
+        // Without a catch-up, apply the narrow-phase half of the changes here (the pairs of
+        // removed colliders must not reach the island update and the solve); the end-of-step
+        // detection applies their broad-phase half. The catch-up detection applies both.
+        let epoch_before = islands.active_set_epoch;
+        if !catch_up {
+            self.counters.stages.collision_detection_time.resume();
+            self.counters.cd.narrow_phase_time.resume();
+            narrow_phase.handle_user_changes(
+                Some(islands),
+                &modified_colliders,
+                &removed_colliders,
+                colliders,
+                bodies,
+                events,
+            );
+            self.counters.cd.narrow_phase_time.pause();
+            self.counters.stages.collision_detection_time.pause();
+        }
+
+        // The stored contacts are unusable for this solve, or the narrow-phase woke sleeping
+        // bodies (those touching a modified collider, the parents of removed colliders) that
+        // must be solved with their contacts: detect before the solve, as `step_inner` does.
+        if catch_up || islands.active_set_epoch != epoch_before {
+            self.detect_collisions(
+                integration_parameters,
+                islands,
+                broad_phase,
+                narrow_phase,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                &modified_colliders,
+                &removed_colliders,
+                hooks,
+                events,
+                catch_up,
+            );
+
+            self.clear_user_changes(
+                bodies,
+                colliders,
+                &mut modified_colliders,
+                &mut removed_colliders,
+                &mut modified_bodies,
+            );
+        }
 
         self.run_substeps(
             gravity,

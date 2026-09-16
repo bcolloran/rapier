@@ -276,16 +276,32 @@ impl PhysicsPipeline {
     /// The changes made since the last call are applied before the solve, as with `step`, and
     /// so is their narrow-phase half: the contact pairs of removed colliders are dropped, and
     /// the pairs of modified colliders are woken and recolored. The contacts themselves are
-    /// recomputed by the detection at the end of the step, after the solve, so a change reaches
-    /// the contacts one step late: that step's solve uses the contacts detected at the end of
-    /// the previous step. For example:
+    /// recomputed by the detection at the end of the step, after the solve, except when a
+    /// change leaves the stored contacts unusable for that solve. Then the step also detects
+    /// collisions before its solve, as `step` does (a catch-up), on steps where:
     ///
-    /// - An inserted collider has no contacts for that solve; a collider that changed its shape,
-    ///   collision groups, sensor status or parent, or a body that changed its type or dominance
-    ///   group, is solved with the contacts stored for its previous state.
-    /// - Position-only changes (teleports): the solve uses the contacts detected at the previous
-    ///   poses, and CCD sweeps in that step still see a collider teleported that step at its
-    ///   previous position, so a fast body can tunnel through a wall moved into its path.
+    /// - a collider is inserted, enabled or disabled (also through its body);
+    /// - a collider changes its shape, collision groups, sensor status or parent body;
+    /// - a body changes its type or dominance group;
+    /// - a sleeping body is woken, by the user, by an edited joint, by a moved fixed body it is
+    ///   jointed to or by a modified collider it touches (falling asleep cleared the solver
+    ///   selection of the contacts it rests on, which the detection restores), or a body is
+    ///   removed: the set of active bodies changed;
+    /// - an impulse joint or a multibody joint is inserted or removed (a joint can disable the
+    ///   contacts between its bodies).
+    ///
+    /// The deferred collider changes are exactly those the narrow-phase recycles a pair's
+    /// contacts through. On a catch-up step, collision detection runs twice, so the physics
+    /// hooks may run twice for the same pair; collision events are only emitted when a pair
+    /// starts or stops touching, so they are not duplicated.
+    ///
+    /// Every other change reaches the contacts one step late: that step's solve uses the
+    /// contacts detected at the end of the previous step. This includes:
+    ///
+    /// - Position-only changes (teleports) of colliders that touch no sleeping body: the solve
+    ///   uses the contacts detected at the previous poses, and CCD sweeps in that step still see
+    ///   a collider teleported that step at its previous position, so a fast body can tunnel
+    ///   through a wall moved into its path.
     /// - Removals of colliders: their contact pairs leave the solve right away, but a body that
     ///   lost a collider keeps its other contacts anchored to its previous center of mass for
     ///   that solve, and the broad-phase only drops the removed colliders at the end of the
@@ -297,10 +313,8 @@ impl PhysicsPipeline {
     ///   flags from the end-of-step detection, which emits them.
     /// - Center-of-mass changes (a collider's mass properties, a body's additional mass
     ///   properties): the stored contacts are anchored relative to the previous center of mass.
-    /// - An inserted or removed joint changes which contacts the solve may use, from the next
-    ///   step on.
-    /// - A sleeping body that is woken is solved for one step without the contacts it rested on
-    ///   (falling asleep cleared their solver selection, which the detection restores).
+    /// - Edits to an existing joint, such as enabling or disabling the contacts between its
+    ///   bodies: only inserting or removing a joint triggers the catch-up.
     ///
     /// A simulation uses either `step` or this method, not both: after a `step`, the
     /// narrow-phase describes the poses that step started from, and this method does not
