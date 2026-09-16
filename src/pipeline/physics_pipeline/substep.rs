@@ -681,4 +681,206 @@ impl PhysicsPipeline {
 
         self.end_step(colliders, modified_colliders);
     }
+
+    /// Ends a collision detection that runs after the solve, outside of the substep
+    /// loop that normally follows a detection:
+    /// - reconciles the solver contact graph with the pairs the detection changed now, rather
+    ///   than at the next solve, then drops the reconciled list: the narrow-phase doesn't
+    ///   serialize it, so a world restored from a snapshot taken between steps and the
+    ///   uninterrupted world must reach their next solve with the same, empty list;
+    /// - joins the deferred BVH optimization the detection may have started, so that scene
+    ///   queries and snapshots between steps see the whole broad-phase.
+    fn finish_collision_detection(
+        &mut self,
+        islands: &IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &RigidBodySet,
+        colliders: &ColliderSet,
+        multibody_joints: &MultibodyJointSet,
+    ) {
+        self.counters
+            .stages
+            .island_constraints_collection_time
+            .resume();
+        narrow_phase.maintain_solver_contact_graph(islands, bodies, colliders, multibody_joints);
+        narrow_phase.clear_solver_graph_dirty();
+        self.counters
+            .stages
+            .island_constraints_collection_time
+            .pause();
+
+        self.join_deferred_bvh_optimize(broad_phase);
+    }
+
+    /// One physics step with the collision detection last: the stages of
+    /// [`PhysicsPipeline::step_collisions_last`], in order.
+    ///
+    /// Compared to [`Self::step_inner`], the collision detection moves from before the substep
+    /// loop to after it, so the narrow-phase describes the poses the step ends with. The user
+    /// changes are still applied before the solve, and so is their narrow-phase half (the pairs
+    /// of removed colliders must not reach the island update and the solve); the detection at
+    /// the end applies their broad-phase half and recomputes the contacts.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn step_collisions_last_inner(
+        &mut self,
+        gravity: Vector,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.begin_step();
+
+        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
+            .handle_user_changes(
+                islands,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                ccd_solver,
+            );
+
+        // Apply the narrow-phase half of the changes here (the pairs of removed colliders must
+        // not reach the island update and the solve); the end-of-step detection applies their
+        // broad-phase half.
+        self.counters.stages.collision_detection_time.resume();
+        self.counters.cd.narrow_phase_time.resume();
+        narrow_phase.handle_user_changes(
+            Some(islands),
+            &modified_colliders,
+            &removed_colliders,
+            colliders,
+            bodies,
+            events,
+        );
+        self.counters.cd.narrow_phase_time.pause();
+        self.counters.stages.collision_detection_time.pause();
+
+        self.run_substeps(
+            gravity,
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            ccd_solver,
+            &mut modified_colliders,
+            hooks,
+            events,
+        );
+
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            false,
+        );
+
+        self.clear_user_changes(
+            bodies,
+            colliders,
+            &mut modified_colliders,
+            &mut removed_colliders,
+            &mut modified_bodies,
+        );
+
+        self.finish_collision_detection(
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            multibody_joints,
+        );
+
+        self.end_step(colliders, modified_colliders);
+    }
+
+    /// The initial collision detection of the collisions-last stepping order: the stages of
+    /// [`PhysicsPipeline::initialize_collisions_last`], in order. The prefix of
+    /// [`Self::step_inner`] up to and including its collision detection (no solve), ended
+    /// the way a collisions-last step ends its detection.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn initialize_collisions_last_inner(
+        &mut self,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.begin_step();
+
+        let (mut modified_colliders, mut removed_colliders, mut modified_bodies) = self
+            .handle_user_changes(
+                islands,
+                bodies,
+                colliders,
+                impulse_joints,
+                multibody_joints,
+                ccd_solver,
+            );
+
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            true,
+        );
+
+        self.clear_user_changes(
+            bodies,
+            colliders,
+            &mut modified_colliders,
+            &mut removed_colliders,
+            &mut modified_bodies,
+        );
+
+        self.finish_collision_detection(
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            multibody_joints,
+        );
+
+        self.end_step(colliders, modified_colliders);
+    }
 }
