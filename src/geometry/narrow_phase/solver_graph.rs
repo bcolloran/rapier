@@ -840,4 +840,9 @@ impl NarrowPhase {
     pub(crate) fn solver_graph(&self) -> &SolverContactGraph {
         &self.solver_contact_graph
     }
+
+    /// Whether a contact-modification hook requested a contact adhesion during the last update.
+    pub(crate) fn adhesion_requested(&self) -> bool {
+        self.adhesion_requested
+    }
 }

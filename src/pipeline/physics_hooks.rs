@@ -1,7 +1,9 @@
 #[cfg(feature = "alloc")]
 use crate::dynamics::{RigidBodyHandle, RigidBodySet};
 #[cfg(feature = "alloc")]
-use crate::geometry::{ColliderHandle, ColliderSet, ContactManifold, SolverContacts, SolverFlags};
+use crate::geometry::{
+    AdhesionBudget, ColliderHandle, ColliderSet, ContactManifold, SolverContacts, SolverFlags,
+};
 #[cfg(feature = "alloc")]
 use crate::math::{Real, Vector};
 #[cfg(feature = "alloc")]
@@ -63,6 +65,50 @@ pub struct ContactModificationContext<'a> {
     // NOTE: we keep this a &'a mut u32 to emphasize the
     // fact that this can be modified.
     pub user_data: &'a mut u32,
+    /// Requests an attractive force that pulls the two bodies together, for example glue or
+    /// suction.
+    ///
+    /// The engine applies it along the contact normal, spread over the solver contacts, as an
+    /// external force on both bodies just before the contact solver runs. The contacts stay
+    /// push-only, thus they supply the reaction that holds the bodies together, and the friction
+    /// that comes with it. The bodies separate when the load becomes larger than the adhesion.
+    ///
+    /// This is an absolute force *for each manifold*. A body that rests on a surface made of N
+    /// colliders touches about N manifolds, and thus receives about N times the pull. Use
+    /// [`Self::adhesion_pressure`] or [`Self::adhesion_budget`] to make the pull independent of
+    /// the number of colliders that make the surface.
+    ///
+    /// Only awake dynamic bodies are pulled. A body that the solver holds in place because of a
+    /// higher dominance group is not pulled, because it receives no contact reaction either.
+    ///
+    /// This value is set to `0.0` before each call, thus the hook must request the adhesion at
+    /// each step. Negative values do nothing.
+    pub adhesion_force: &'a mut Real,
+    /// Requests an attractive force for each unit of contact patch: for each meter of contact
+    /// length in 2D, for each square meter of contact area in 3D.
+    ///
+    /// The engine multiplies this pressure by the extent of the contact patch, measured
+    /// perpendicular to the normal after this hook returns, and applies the result exactly like
+    /// [`Self::adhesion_force`]. The two add together.
+    ///
+    /// The patches of colliders that are adjacent do not overlap, thus they divide the total
+    /// contact patch of the body between them. The total force and torque are therefore the same
+    /// whether the surface is one large collider or many small ones. But the patches of colliders
+    /// that *do* overlap are counted two times; use [`Self::adhesion_budget`] if this can occur.
+    ///
+    /// A contact patch must have at least 2 points in 2D, or 3 points in 3D, to have an extent.
+    /// Point contacts, and line contacts in 3D, thus receive no adhesion from a pressure.
+    ///
+    /// This value is set to `0.0` before each call. Negative values do nothing.
+    pub adhesion_pressure: &'a mut Real,
+    /// Adds this manifold to an adhesion pool that shares one total force; see [`AdhesionBudget`].
+    ///
+    /// Use this when the total pull must stay the same however many manifolds carry the contact,
+    /// including manifolds of colliders that overlap. It adds to [`Self::adhesion_force`] and
+    /// [`Self::adhesion_pressure`].
+    ///
+    /// This value is set to `None` before each call.
+    pub adhesion_budget: &'a mut Option<AdhesionBudget>,
 }
 
 #[cfg(feature = "alloc")]
@@ -253,6 +299,9 @@ pub trait PhysicsHooks: crate::utils::MaybeSync {
     /// as 0 and can be modified in `context.user_data`.
     ///
     /// The world-space contact normal can be modified in `context.normal`.
+    ///
+    /// An attractive force that pulls the two bodies together can be requested with
+    /// `context.adhesion_force`, `context.adhesion_pressure` or `context.adhesion_budget`.
     fn modify_solver_contacts(&self, _context: &mut ContactModificationContext) {}
 }
 

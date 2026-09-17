@@ -370,6 +370,16 @@ impl PhysicsPipeline {
             #[cfg(not(feature = "parallel"))]
             let num_threads = 1;
 
+            // Contact adhesion requested by the hooks, added to the effective forces that the
+            // traversal above computed, just before the solver reads them.
+            if narrow_phase.adhesion_requested() {
+                super::adhesion::apply_contact_adhesion(
+                    narrow_phase.solver_graph(),
+                    &manifold_store,
+                    bodies,
+                );
+            }
+
             let joint_assembly_epoch = impulse_joints.assembly_epoch;
             self.staged_solver.init_and_solve(
                 num_threads,

@@ -80,6 +80,9 @@ pub(super) fn process_pair(
     query_dispatcher: &dyn PersistentQueryDispatcher<ContactManifoldData, ContactData>,
     awake_body_mask: &[bool],
     hints_ptr: &HintsPtr,
+    // Set when a hook requests a contact adhesion, so the pipeline can skip its
+    // adhesion pass entirely when no manifold carries a request.
+    adhesion_flag: &core::sync::atomic::AtomicBool,
     #[cfg(not(feature = "parallel"))] transitions: &mut Vec<PairTransition>,
     #[cfg(feature = "parallel")] snd: &std::sync::mpsc::Sender<PairTransition>,
 ) -> u8 {
@@ -381,6 +384,10 @@ pub(super) fn process_pair(
                 manifold.data.relative_dominance =
                     dominance1.effective_group(&rb_type1) - dominance2.effective_group(&rb_type2);
                 manifold.data.normal = world_pos1.rotation * manifold.local_n1;
+                // Adhesion is requested on, and applied through, the clusters only.
+                manifold.data.adhesion_force = 0.0;
+                manifold.data.adhesion_pressure = 0.0;
+                manifold.data.adhesion_budget = None;
             }
         } else if !pair.solver_clusters.is_empty() {
             // Clustering stopped applying to this pair: carry the warm-start
@@ -399,6 +406,10 @@ pub(super) fn process_pair(
         } else {
             &mut pair.manifolds
         };
+
+        // Set when the hook requests an adhesion on any manifold of this pair; see the
+        // recycle state below.
+        let mut adhesion_requested = false;
 
         for manifold in solver_manifolds {
             let world_pos1 = manifold.subshape_pos1().prepend_to(&co1.pos);
@@ -505,6 +516,11 @@ pub(super) fn process_pair(
                 let mut modifiable_normal = manifold.data.normal;
                 let mut modifiable_friction = manifold.data.friction;
                 let mut modifiable_restitution = manifold.data.restitution;
+                // Adhesion is requested again every time the hook runs. It is not persistent
+                // like `user_data`.
+                let mut modifiable_adhesion_force = 0.0;
+                let mut modifiable_adhesion_pressure = 0.0;
+                let mut modifiable_adhesion_budget = None;
 
                 let mut context = ContactModificationContext {
                     bodies,
@@ -519,6 +535,9 @@ pub(super) fn process_pair(
                     friction: &mut modifiable_friction,
                     restitution: &mut modifiable_restitution,
                     user_data: &mut modifiable_user_data,
+                    adhesion_force: &mut modifiable_adhesion_force,
+                    adhesion_pressure: &mut modifiable_adhesion_pressure,
+                    adhesion_budget: &mut modifiable_adhesion_budget,
                 };
 
                 hooks.modify_solver_contacts(&mut context);
@@ -528,6 +547,18 @@ pub(super) fn process_pair(
                 manifold.data.friction = modifiable_friction;
                 manifold.data.restitution = modifiable_restitution;
                 manifold.data.user_data = modifiable_user_data;
+                manifold.data.adhesion_force = modifiable_adhesion_force;
+                manifold.data.adhesion_pressure = modifiable_adhesion_pressure;
+                manifold.data.adhesion_budget = modifiable_adhesion_budget;
+                adhesion_requested |= modifiable_adhesion_force > 0.0
+                    || modifiable_adhesion_pressure > 0.0
+                    || modifiable_adhesion_budget.is_some_and(|budget| budget.total > 0.0);
+            } else {
+                // The hook flag was removed since the last update of this pair. Drop the
+                // adhesion it requested then, so it does not stay as a force nobody asks for.
+                manifold.data.adhesion_force = 0.0;
+                manifold.data.adhesion_pressure = 0.0;
+                manifold.data.adhesion_budget = None;
             }
 
             // Localize solver contacts: bake skins (and hook-written `dist`) into the anchors, then
@@ -579,7 +610,13 @@ pub(super) fn process_pair(
 
         // Remember the relative configuration this full update ran at, so
         // subsequent steps can recycle the pair while it stays close to it.
-        if contact_recycle_distance > 0.0 {
+        if adhesion_requested {
+            adhesion_flag.store(true, core::sync::atomic::Ordering::Relaxed);
+            // Pairs with hooks are never recycled, but `Collider::set_active_hooks` does not
+            // flag a collider change. Without a recycle state, the next update of this pair is
+            // a full one: it runs the hook, or drops the adhesion when the flag is gone.
+            pair.recycle_state = None;
+        } else if contact_recycle_distance > 0.0 {
             // Computing the local AABBs goes through a dyn Shape call per
             // collider per full update; the extents only change when a
             // shape does, so reuse the previous full update's value.

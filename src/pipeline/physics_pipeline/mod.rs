@@ -14,12 +14,15 @@ use crate::geometry::{
 use crate::math::Vector;
 use crate::pipeline::{EventHandler, PhysicsHooks};
 
+mod adhesion;
 mod quarantine;
 pub use quarantine::Quarantine;
 mod solve;
 mod substep;
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_adhesion;
 #[cfg(test)]
 mod test_staged;
 

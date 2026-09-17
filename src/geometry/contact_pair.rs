@@ -579,6 +579,64 @@ pub struct ContactManifoldData {
     /// The effective restitution coefficient of this manifold's contacts.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub restitution: Real,
+    /// An attractive force that pulls the two colliders together, as requested by the
+    /// contact-modification hook through [`ContactModificationContext::adhesion_force`].
+    ///
+    /// `0.0` (the default) is an ordinary contact.
+    ///
+    /// Not serialized. A manifold that carries a request is updated in full at every step, thus
+    /// the hook writes the request again before it is read, and a manifold that is not updated
+    /// belongs to sleeping bodies, which adhesion does not pull.
+    ///
+    /// [`ContactModificationContext::adhesion_force`]: crate::pipeline::ContactModificationContext::adhesion_force
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub adhesion_force: Real,
+    /// An attractive force per unit of contact patch, as requested by the contact-modification
+    /// hook through [`ContactModificationContext::adhesion_pressure`].
+    ///
+    /// `0.0` (the default) is an ordinary contact. Not serialized, see [`Self::adhesion_force`].
+    ///
+    /// [`ContactModificationContext::adhesion_pressure`]: crate::pipeline::ContactModificationContext::adhesion_pressure
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub adhesion_pressure: Real,
+    /// The adhesion pool this manifold belongs to, as requested by the contact-modification hook
+    /// through [`ContactModificationContext::adhesion_budget`].
+    ///
+    /// `None` (the default) is an ordinary contact. Not serialized, see [`Self::adhesion_force`].
+    ///
+    /// [`ContactModificationContext::adhesion_budget`]: crate::pipeline::ContactModificationContext::adhesion_budget
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub adhesion_budget: Option<AdhesionBudget>,
+}
+
+/// A total adhesion force shared by all the contact manifolds of one pool during a timestep.
+///
+/// Use this when one number must mean "this part of my body is this sticky", whatever the
+/// number of manifolds that carry the contact: one large collider, many small tiles, colliders
+/// that overlap, or a pair of point contacts on both sides of a seam. The sum of the forces
+/// applied to the pool is always its total.
+///
+/// A pool is identified by `(owner, channel)`:
+/// - `owner` is an opaque identity that the engine never dereferences. It is usually the
+///   collider that the budget belongs to. Different bodies must use different owners, or their
+///   budgets merge.
+/// - `channel` separates independent parts of the same owner, for example `0` for the feet and
+///   `1` for the flank. A body in a corner can thus spend the two budgets at the same time.
+///
+/// The total of a pool is the **largest** of the totals that its manifolds request. It is not
+/// their sum, so colliders that overlap cannot increase it. Each manifold receives a part of the
+/// total in proportion to the extent of its contact patch. Point contacts have no extent, but
+/// they keep a small minimum weight: a pool that contains only one point contact receives the
+/// full total.
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+pub struct AdhesionBudget {
+    /// The identity of the pool. It is usually the collider that this budget belongs to.
+    pub owner: ColliderHandle,
+    /// Separates independent budgets of the same owner, for example the feet and the flank.
+    pub channel: u32,
+    /// The total adhesion force shared by the pool during this timestep.
+    pub total: Real,
 }
 
 /// A single solver contact.
@@ -803,6 +861,9 @@ impl ContactManifoldData {
             user_data: 0,
             friction: 0.0,
             restitution: 0.0,
+            adhesion_force: 0.0,
+            adhesion_pressure: 0.0,
+            adhesion_budget: None,
         }
     }
 

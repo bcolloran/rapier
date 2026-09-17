@@ -47,6 +47,8 @@ impl NarrowPhase {
         let hints_ptr = &hints_ptr;
 
         let query_dispatcher = &*self.query_dispatcher;
+        let adhesion_flag = core::sync::atomic::AtomicBool::new(false);
+        let adhesion_flag = &adhesion_flag;
         #[cfg(feature = "parallel")]
         let (snd, rcv) = std::sync::mpsc::channel();
 
@@ -99,6 +101,7 @@ impl NarrowPhase {
                 query_dispatcher,
                 &awake_body_mask,
                 hints_ptr,
+                adhesion_flag,
                 &mut transitions,
             )
         };
@@ -125,6 +128,7 @@ impl NarrowPhase {
                 query_dispatcher,
                 &awake_body_mask,
                 hints_ptr,
+                adhesion_flag,
                 &snd,
             )
         };
@@ -280,6 +284,7 @@ impl NarrowPhase {
 
         self.update_candidates = update_candidates;
         self.awake_body_mask = awake_body_mask;
+        self.adhesion_requested = adhesion_flag.load(core::sync::atomic::Ordering::Relaxed);
         #[cfg(not(feature = "parallel"))]
         {
             self.solver_graph_dirty = solver_graph_dirty;
