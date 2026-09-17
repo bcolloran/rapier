@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod add_remove2;
+mod adhesion2;
 mod b2d_compounds;
 mod b2d_joint_grid;
 mod b2d_junkyard;
@@ -110,6 +111,7 @@ pub async fn main() {
         COLLISIONS, "Voxels", voxels2::run;
         COLLISIONS, "Collision groups", collision_groups2::run;
         COLLISIONS, "One-way platforms", one_way_platforms2::run;
+        COLLISIONS, "Adhesion", adhesion2::run;
         // ── Dynamics ────────────────────────────────────────────────────────
         DYNAMICS, "Locked rotations", locked_rotations2::run;
         DYNAMICS, "Restitution", restitution2::run;

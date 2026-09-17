@@ -10,6 +10,7 @@ mod utils;
 // Examples gated on `not(target_arch = "wasm32")` load meshes, robot
 // descriptions or scene dumps from disk, so they can't run in a browser.
 
+mod adhesion3;
 mod b3d_joint_grid;
 mod b3d_junkyard;
 mod b3d_large_pyramid;
@@ -136,6 +137,7 @@ pub async fn main() {
         COLLISIONS, "Voxels", voxels3::run;
         COLLISIONS, "Collision groups", collision_groups3::run;
         COLLISIONS, "One-way platforms", one_way_platforms3::run;
+        COLLISIONS, "Adhesion", adhesion3::run;
         // ── Dynamics ────────────────────────────────────────────────────────
         DYNAMICS, "Locked rotations", locked_rotations3::run;
         DYNAMICS, "Restitution", restitution3::run;
