@@ -155,6 +155,69 @@ impl PhysicsWorld {
         );
     }
 
+    /// Run the initial collision detection of the collisions-last stepping order, once before
+    /// the first [`step_collisions_last`](Self::step_collisions_last), using no hooks and no
+    /// event handler. See [`PhysicsPipeline::initialize_collisions_last`].
+    pub fn initialize_collisions_last(&mut self) {
+        self.initialize_collisions_last_with_events(&(), &());
+    }
+
+    /// Run the initial collision detection of the collisions-last stepping order, once before
+    /// the first [`step_collisions_last`](Self::step_collisions_last), with custom physics hooks
+    /// and event handling. See [`PhysicsPipeline::initialize_collisions_last`].
+    pub fn initialize_collisions_last_with_events(
+        &mut self,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.physics_pipeline.initialize_collisions_last(
+            &self.integration_parameters,
+            &mut self.islands,
+            &mut self.broad_phase,
+            &mut self.narrow_phase,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            &mut self.ccd_solver,
+            hooks,
+            events,
+        );
+    }
+
+    /// Advance the simulation by one timestep with the collision detection last, using no hooks
+    /// and no event handler. See [`PhysicsPipeline::step_collisions_last`].
+    ///
+    /// When it returns, the contact and intersection pairs describe the current poses of the
+    /// bodies. Call [`initialize_collisions_last`](Self::initialize_collisions_last) once before
+    /// the first step. A simulation uses either this method or [`step`](Self::step), not both.
+    pub fn step_collisions_last(&mut self) {
+        self.step_collisions_last_with_events(&(), &());
+    }
+
+    /// Advance the simulation by one timestep with the collision detection last, with custom
+    /// physics hooks and event handling. See [`PhysicsPipeline::step_collisions_last`].
+    pub fn step_collisions_last_with_events(
+        &mut self,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.physics_pipeline.step_collisions_last(
+            self.gravity,
+            &self.integration_parameters,
+            &mut self.islands,
+            &mut self.broad_phase,
+            &mut self.narrow_phase,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            &mut self.ccd_solver,
+            hooks,
+            events,
+        );
+    }
+
     /// The bodies and colliders automatically disabled during the last step because their
     /// state became non-finite; see [`Quarantine`].
     pub fn quarantine(&self) -> &Quarantine {

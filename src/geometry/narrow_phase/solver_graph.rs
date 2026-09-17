@@ -123,6 +123,22 @@ impl NarrowPhase {
         }
     }
 
+    /// Empties the list of pairs the next [`Self::maintain_solver_contact_graph`] would
+    /// reconcile incrementally. For a caller that just ran that maintenance outside of a
+    /// solve: the list is not serialized, so a world restored from a snapshot and the
+    /// uninterrupted world it was taken from must reach their next solve with the same,
+    /// empty list.
+    pub(crate) fn clear_solver_graph_dirty(&mut self) {
+        self.solver_graph_dirty.clear();
+    }
+
+    /// The [`IslandManager::active_set_epoch`] the solver contact graph was last maintained
+    /// at: [`Self::maintain_solver_contact_graph`] leaves it equal to the island manager's, so
+    /// a different value there means the active set changed since (a wake-up, a body removal).
+    pub(crate) fn solver_graph_epoch(&self) -> u32 {
+        self.solver_graph_epoch
+    }
+
     /// Maintains the persistent per-color [`SolverContactGraph`]:
     /// full rebuild when the awake set shifts (epoch bump),
     /// else only this step's fully-updated pairs reconcile — unchanged manifolds keep their slots.
