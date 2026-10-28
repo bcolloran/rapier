@@ -374,6 +374,8 @@ impl PhysicsPipeline {
             crate::dynamics::solver::manifold_store::ManifoldStore::from_parts(manifold_store_parts)
         };
 
+        super::adhesion::apply_adhesion(bodies, narrow_phase.solver_graph(), &manifold_store);
+
         // Solve the single awake island. The staged solver is the only solver: a parallel
         // build fans the colored constraints across `num_threads` workers; otherwise
         // `num_threads` = 1 and it runs inline, skipping all cross-worker coordination.

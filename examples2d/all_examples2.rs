@@ -6,6 +6,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod add_remove2;
+mod adhesion2;
+mod adhesion_climb2;
+mod adhesion_curved2;
+mod adhesion_grid2;
+mod adhesion_slide2;
+mod adhesion_teeter2;
 mod b2d_compounds;
 mod b2d_joint_grid;
 mod b2d_junkyard;
@@ -133,6 +139,12 @@ pub async fn main() {
         DYNAMICS, "Restitution", restitution2::run;
         DYNAMICS, "Damping", damping2::run;
         DYNAMICS, "CCD", ccd2::run;
+        DYNAMICS, "Adhesion", adhesion2::run;
+        DYNAMICS, "Adhesion grid", adhesion_grid2::run;
+        DYNAMICS, "Adhesion (curved)", adhesion_curved2::run;
+        DYNAMICS, "Adhesion climb", adhesion_climb2::run;
+        DYNAMICS, "Adhesion slide", adhesion_slide2::run;
+        DYNAMICS, "Adhesion teeter", adhesion_teeter2::run;
         // ── Joints ──────────────────────────────────────────────────────────
         JOINTS, "Joints", joints2::run;
         JOINTS, "Rope Joints", rope_joints2::run;

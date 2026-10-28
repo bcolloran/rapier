@@ -16,10 +16,15 @@ use crate::pipeline::{EventHandler, PhysicsHooks};
 
 mod quarantine;
 pub use quarantine::Quarantine;
+mod adhesion;
 mod solve;
 mod substep;
 #[cfg(test)]
 mod test;
+#[cfg(all(test, feature = "dim2"))]
+mod test_adhesion;
+#[cfg(test)]
+mod test_adhesion_contract;
 #[cfg(test)]
 mod test_staged;
 

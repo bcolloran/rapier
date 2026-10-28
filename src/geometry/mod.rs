@@ -22,10 +22,12 @@ pub(crate) use self::contact_pair::SOLVER_DYNAMIC_COLOR_COUNT;
 pub(crate) use self::contact_pair::relative_pose_drift;
 #[cfg(feature = "alloc")]
 pub use self::contact_pair::{
-    ContactData, ContactId, ContactManifoldData, ContactPair, IntersectionPair, NEW_CONTACT_BIT,
-    PairContacts, RigidPairContacts, SimdSolverContact, SolverContact, SolverContactGeneric,
-    SolverContacts, SolverFlags, is_bouncy, is_bouncy_simd,
+    AdhesionBudget, ContactData, ContactId, ContactManifoldData, ContactPair, IntersectionPair,
+    NEW_CONTACT_BIT, PairContacts, RigidPairContacts, SimdSolverContact, SolverContact,
+    SolverContactGeneric, SolverContacts, SolverFlags, is_bouncy, is_bouncy_simd,
 };
+#[cfg(feature = "alloc")]
+pub(crate) mod contact_patch;
 #[cfg(feature = "alloc")]
 pub use self::interaction_graph::{
     ColliderGraphIndex, InteractionGraph, RigidBodyGraphIndex, TemporaryInteractionIndex,

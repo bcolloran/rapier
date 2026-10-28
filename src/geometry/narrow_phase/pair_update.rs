@@ -626,6 +626,10 @@ pub(super) fn process_pair(
                 let mut modifiable_normal = manifold.data.normal;
                 let mut modifiable_friction = manifold.data.friction;
                 let mut modifiable_restitution = manifold.data.restitution;
+                // Adhesion requests are renewed by each contact-modification callback.
+                let mut adhesion_force = 0.0;
+                let mut adhesion_pressure = 0.0;
+                let mut adhesion_budget = None;
 
                 let mut context = ContactModificationContext {
                     bodies,
@@ -641,6 +645,9 @@ pub(super) fn process_pair(
                         friction: &mut modifiable_friction,
                         restitution: &mut modifiable_restitution,
                         user_data: &mut modifiable_user_data,
+                        adhesion_force: &mut adhesion_force,
+                        adhesion_pressure: &mut adhesion_pressure,
+                        adhesion_budget: &mut adhesion_budget,
                     }),
                 };
 
@@ -651,6 +658,13 @@ pub(super) fn process_pair(
                 manifold.data.friction = modifiable_friction;
                 manifold.data.restitution = modifiable_restitution;
                 manifold.data.user_data = modifiable_user_data;
+                manifold.data.adhesion_force = adhesion_force;
+                manifold.data.adhesion_pressure = adhesion_pressure;
+                manifold.data.adhesion_budget = adhesion_budget;
+            } else {
+                manifold.data.adhesion_force = 0.0;
+                manifold.data.adhesion_pressure = 0.0;
+                manifold.data.adhesion_budget = None;
             }
 
             // Localize solver contacts: bake skins (and hook-written `dist`) into the anchors, then
@@ -703,7 +717,9 @@ pub(super) fn process_pair(
 
         // Remember the relative configuration this full update ran at, so
         // subsequent steps can recycle the pair while it stays close to it.
-        if contact_recycle_distance > 0.0 {
+        // Hook-modified contacts must be rebuilt when the hook is removed, so
+        // transient requests (including adhesion) cannot survive through recycling.
+        if contact_recycle_distance > 0.0 && active_hooks.is_empty() {
             // Computing the local AABBs goes through a dyn Shape call per
             // collider per full update; the extents only change when a
             // shape does, so reuse the previous full update's value.
@@ -734,6 +750,8 @@ pub(super) fn process_pair(
                 max_extent,
                 max_drift,
             });
+        } else {
+            rigid.recycle_state = None;
         }
     }
 

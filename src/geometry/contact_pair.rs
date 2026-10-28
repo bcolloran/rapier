@@ -737,6 +737,37 @@ pub struct ContactManifoldData {
     pub relative_dominance: i16,
     /// A user-defined piece of data.
     pub user_data: u32,
+    /// Attractive adhesion force pulling the two bodies together (e.g. glue or suction).
+    ///
+    /// Applied along [`Self::normal`] (spread over [`Self::solver_contacts`]) before the solver
+    /// runs. `0.0` (default) is an ordinary contact; non-positive values ignored; reset each step.
+    ///
+    /// This is an absolute force *per manifold*: a surface split into N colliders produces ~N
+    /// manifolds and therefore ~N× the total pull. For adhesion that behaves identically on a
+    /// monolithic surface and on the same surface decomposed into many small colliders, use
+    /// [`Self::adhesion_pressure`] instead.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub adhesion_force: Real,
+    /// Attractive adhesion *pressure* pulling the two bodies together, expressed per unit of
+    /// contact patch: force per meter of contact length in 2D, force per square meter of contact
+    /// area in 3D.
+    ///
+    /// The resulting force for this manifold is `adhesion_pressure * tangential_extent()`, applied
+    /// at the patch's length/area centroid (adding to [`Self::adhesion_force`]). Because the contact spans of
+    /// abutting colliders partition the body's total contact patch, this formulation is
+    /// composition-invariant: splitting one big collider into many small ones leaves the total
+    /// adhesion force (and its torque) unchanged. The flip side is that point contacts (2D) and
+    /// point/line contacts (3D) have zero extent and receive no pressure adhesion — use
+    /// [`Self::adhesion_force`] for those.
+    ///
+    /// `0.0` (default) is an ordinary contact; non-positive values ignored; reset each step.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub adhesion_pressure: Real,
+    /// Membership of this manifold in a budgeted adhesion pool (see [`AdhesionBudget`]).
+    ///
+    /// `None` (default) is an ordinary contact; reset each step.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub adhesion_budget: Option<AdhesionBudget>,
     /// The effective friction coefficient of this manifold's contacts (combined from
     /// both colliders' materials; identical for every contact of the manifold).
     #[cfg_attr(feature = "serde-serialize", serde(default))]
@@ -744,6 +775,39 @@ pub struct ContactManifoldData {
     /// The effective restitution coefficient of this manifold's contacts.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub restitution: Real,
+}
+
+/// A *budgeted* adhesion request: a fixed total adhesion force shared by every manifold enrolled
+/// in the same pool during the same timestep.
+///
+/// This is the right model for "this region of my body has stickiness `total`": however many
+/// manifolds happen to implement the region's contact this step — one big collider, many abutting
+/// tiles, *overlapping* colliders, a seam-straddling pair of point contacts — the force applied
+/// across all of them always sums to exactly `total`. Neither [`ContactManifoldData::adhesion_force`]
+/// (which multiplies with the manifold count) nor [`ContactManifoldData::adhesion_pressure`] (which
+/// double-counts overlapping coverage and vanishes on point contacts) has that property.
+///
+/// Pools are keyed by `(owner, channel)`:
+/// - `owner` is an opaque identity, never dereferenced by the engine — typically the collider the
+///   budget belongs to (e.g. a player capsule). Distinct bodies must use distinct owners or their
+///   budgets merge.
+/// - `channel` distinguishes independent regions of the same owner (e.g. `0` = feet, `1` = flank),
+///   so a body in a corner can spend its feet budget *and* its flank budget simultaneously.
+///
+/// Within a pool, the effective total is the **maximum** of the enrolled manifolds' `total`
+/// requests (max, not sum, so duplicated or overlapping colliders can never inflate it), and it is
+/// distributed over the enrolled manifolds proportionally to their tangential extent (point
+/// contacts get a small floor weight, so a lone point contact still receives the full total, while
+/// a degenerate sliver alongside real area contacts receives almost nothing).
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+pub struct AdhesionBudget {
+    /// Opaque pool identity; typically the collider this budget belongs to.
+    pub owner: ColliderHandle,
+    /// Distinguishes independent budgets of the same owner (e.g. feet vs. flank).
+    pub channel: u32,
+    /// Total adhesion force shared by the pool this step. Non-positive values are ignored.
+    pub total: Real,
 }
 
 /// A single solver contact.
@@ -966,9 +1030,29 @@ impl ContactManifoldData {
             solver_contacts: SolverContacts::new(),
             relative_dominance: 0,
             user_data: 0,
+            adhesion_force: 0.0,
+            adhesion_pressure: 0.0,
+            adhesion_budget: None,
             friction: 0.0,
             restitution: 0.0,
         }
+    }
+
+    /// Tangential length (2D) or area (3D) of the convex contact patch.
+    ///
+    /// Resolves the solver's body-local anchors through `bodies`. Point contacts,
+    /// and line contacts in 3D, have zero extent. The normal must have unit length.
+    /// During contact modification, use
+    /// [`crate::pipeline::ModifiableManifold::tangential_extent`] instead.
+    pub fn tangential_extent(&self, bodies: &RigidBodySet) -> Real {
+        super::contact_patch::contact_patch(
+            self.normal,
+            self.solver_contacts.iter().map(|contact| {
+                let (p1, p2) = self.solver_contact_world_points(contact, bodies);
+                (p1 + p2) * 0.5
+            }),
+        )
+        .extent
     }
 
     /// Resolves the world-space contact points (one per body surface) of one solver
