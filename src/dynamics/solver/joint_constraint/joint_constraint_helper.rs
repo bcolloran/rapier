@@ -58,10 +58,12 @@ impl AngularLimitParams<Real> {
         }
 
         let center = (min + max) * 0.5;
+        // Called through simba, not as `f32`'s inherent method (which always calls the platform
+        // libm), so that `enhanced-determinism` routes it to the portable `libm` crate.
         #[cfg(feature = "dim2")]
-        let (sin, cos) = center.sin_cos();
+        let (sin, cos) = simba::scalar::ComplexField::sin_cos(center);
         #[cfg(feature = "dim3")]
-        let (sin, cos) = (center * 0.5).sin_cos();
+        let (sin, cos) = simba::scalar::ComplexField::sin_cos(center * 0.5);
 
         Self {
             center: [cos, sin],
