@@ -204,7 +204,8 @@ impl SoftConstraintsSet {
                 let sb = unsafe { &*awake.ptr };
                 let material = &sb.material;
                 if material.deformation_damping > 0.0 {
-                    awake.damping_factor = 1.0 - (-material.deformation_damping * dt).exp();
+                    awake.damping_factor =
+                        1.0 - simba::scalar::ComplexField::exp(-material.deformation_damping * dt);
                     damping = true;
                 }
                 if sb.volume_preservation && !sb.volume_pieces.is_empty() {
@@ -762,7 +763,8 @@ impl SoftConstraintsSet {
                     let two_pi = Real::simd_two_pi();
                     // Snap-back caps: a strain error moves the particles at about
                     // `erp * strain * cell size` per second.
-                    let cell_size = vol.powf(1.0 / DIM as Real).max(1.0e-6);
+                    let cell_size =
+                        simba::scalar::ComplexField::powf(vol, 1.0 / DIM as Real).max(1.0e-6);
                     let strain_cap = |erp: Real| {
                         if erp > 0.0 {
                             max_corrective_velocity / (erp * cell_size)
