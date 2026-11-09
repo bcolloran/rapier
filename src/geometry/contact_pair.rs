@@ -775,6 +775,9 @@ pub struct ContactManifoldData {
     /// The effective restitution coefficient of this manifold's contacts.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub restitution: Real,
+    /// For each side whose collider uses [`ContactAnchor::Round`](crate::geometry::ContactAnchor::Round), its ball's world-space centre at this manifold's last full contact update; `None` for a body-fixed side. The solver measures that side's separation from a point that keeps its offset from this centre.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub round_anchor_centers: [Option<Vector>; 2],
 }
 
 /// A *budgeted* adhesion request: a fixed total adhesion force shared by every manifold enrolled
@@ -1035,6 +1038,7 @@ impl ContactManifoldData {
             adhesion_budget: None,
             friction: 0.0,
             restitution: 0.0,
+            round_anchor_centers: [None; 2],
         }
     }
 

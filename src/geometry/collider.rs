@@ -4,8 +4,8 @@ use crate::dynamics::{CoefficientCombineRule, MassProperties, RigidBodyHandle, R
 use crate::geometry::HeightFieldFlags;
 use crate::geometry::{
     ActiveCollisionTypes, ColliderChanges, ColliderFlags, ColliderMassProps, ColliderMaterial,
-    ColliderParent, ColliderPosition, ColliderShape, ColliderType, InteractionGroups,
-    MeshConverter, MeshConverterError, SharedShape,
+    ColliderParent, ColliderPosition, ColliderShape, ColliderType, ContactAnchor,
+    InteractionGroups, MeshConverter, MeshConverterError, RoundAnchorNeedsBall, SharedShape,
 };
 use crate::math::{AngVector, DIM, IVector, Pose, Real, Rotation, Vector, rotation_from_angle};
 use crate::parry::transformation::vhacd::VHACDParameters;
@@ -58,6 +58,8 @@ pub struct Collider {
     pub(crate) material: ColliderMaterial,
     pub(crate) flags: ColliderFlags,
     contact_skin: Real,
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    contact_anchor: ContactAnchor,
     contact_force_event_threshold: Real,
     /// Reference to the soft body associated to this collider's shape if it is deformable; the soft
     /// body keeps its mesh (automatic skinning, tearing) and syncs it into the shape each frame.
@@ -180,6 +182,7 @@ impl Collider {
             contact_force_event_threshold,
             user_data,
             contact_skin,
+            contact_anchor,
             deformable_mesh_ref: _soft_mesh, // The soft-body markers belong to the collider's identity.
         } = other;
 
@@ -196,6 +199,7 @@ impl Collider {
         self.flags = *flags;
         self.changes = ColliderChanges::all();
         self.contact_skin = *contact_skin;
+        self.contact_anchor = *contact_anchor;
     }
 
     /// Which physics hooks are enabled for this collider.
@@ -249,6 +253,24 @@ impl Collider {
     /// See the documentation of [`ColliderBuilder::contact_skin`] for details.
     pub fn set_contact_skin(&mut self, skin_thickness: Real) {
         self.contact_skin = skin_thickness;
+    }
+
+    /// How the solver follows this collider's side of its contacts through the substeps.
+    ///
+    /// See [`ContactAnchor`]. A collider whose shape is no longer a ball contacts as [`ContactAnchor::BodyFixed`] whatever this returns.
+    pub fn contact_anchor(&self) -> ContactAnchor {
+        self.contact_anchor
+    }
+
+    /// Sets how the solver follows this collider's side of its contacts through the substeps.
+    ///
+    /// Refuses [`ContactAnchor::Round`] unless this collider is a ball, and leaves the anchor unchanged then. Takes effect at the pair's next full contact update; pairs with a round side are never recycled, so that is the next step.
+    pub fn set_contact_anchor(
+        &mut self,
+        anchor: ContactAnchor,
+    ) -> Result<(), RoundAnchorNeedsBall> {
+        self.contact_anchor = anchor.check_shape(self.shape.shape_type())?;
+        Ok(())
     }
 
     /// The friction coefficient of this collider (how "slippery" it is).
@@ -578,9 +600,18 @@ impl Collider {
     }
 
     /// Sets the shape of this collider.
+    ///
+    /// A shape that is not a ball resets a [`ContactAnchor::Round`] anchor to [`ContactAnchor::BodyFixed`].
     pub fn set_shape(&mut self, shape: SharedShape) {
         self.changes.insert(ColliderChanges::SHAPE);
         self.shape = shape;
+        if self
+            .contact_anchor
+            .check_shape(self.shape.shape_type())
+            .is_err()
+        {
+            self.contact_anchor = ContactAnchor::BodyFixed;
+        }
     }
 
     /// Returns the shape as a `SharedShape` (reference-counted shape).
@@ -727,6 +758,9 @@ pub struct ColliderBuilder {
     pub contact_force_event_threshold: Real,
     /// An extra thickness around the collider shape to keep them further apart when colliding.
     pub contact_skin: Real,
+    /// How the solver follows the collider's side of its contacts through the substeps. Set it with [`ColliderBuilder::contact_anchor`], which checks the shape; a non-ball collider built with [`ContactAnchor::Round`] written here directly contacts as [`ContactAnchor::BodyFixed`].
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub contact_anchor: ContactAnchor,
 }
 
 impl Default for ColliderBuilder {
@@ -756,6 +790,7 @@ impl ColliderBuilder {
             enabled: true,
             contact_force_event_threshold: 0.0,
             contact_skin: 0.0,
+            contact_anchor: ContactAnchor::BodyFixed,
         }
     }
 
@@ -1458,6 +1493,14 @@ impl ColliderBuilder {
         self
     }
 
+    /// Sets how the solver follows the collider's side of its contacts through the substeps; see [`ContactAnchor`].
+    ///
+    /// Refuses [`ContactAnchor::Round`] unless the builder's shape is a ball.
+    pub fn contact_anchor(mut self, anchor: ContactAnchor) -> Result<Self, RoundAnchorNeedsBall> {
+        self.contact_anchor = anchor.check_shape(self.shape.shape_type())?;
+        Ok(self)
+    }
+
     /// Sets whether this collider starts enabled or disabled.
     ///
     /// Default is `true` (enabled). Set to `false` to create a disabled collider.
@@ -1514,6 +1557,7 @@ impl ColliderBuilder {
             coll_type,
             contact_force_event_threshold: self.contact_force_event_threshold,
             contact_skin: self.contact_skin,
+            contact_anchor: self.contact_anchor,
             deformable_mesh_ref: None,
             user_data: self.user_data,
         }

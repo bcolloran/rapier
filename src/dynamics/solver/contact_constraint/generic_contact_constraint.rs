@@ -6,7 +6,7 @@ use crate::math::TangentImpulse;
 use crate::math::{DIM, DVector, MAX_MANIFOLD_POINTS, Real};
 use crate::utils::{self, AngularInertiaOps, CrossProduct, DotProduct};
 
-use super::{ContactConstraintNormalPart, ContactConstraintTangentPart};
+use super::{ContactConstraintNormalPart, ContactConstraintTangentPart, RoundAnchorPoint};
 use crate::dynamics::solver::CoulombContactPointInfos;
 use crate::dynamics::solver::manifold_store::ManifoldStore;
 use crate::dynamics::solver::solver_body::SolverBodies;
@@ -21,6 +21,8 @@ pub(crate) struct GenericContactConstraintBuilder {
     infos: [CoulombContactPointInfos<Real>; MAX_MANIFOLD_POINTS],
     handle1: RigidBodyHandle,
     handle2: RigidBodyHandle,
+    /// The anchors of the round separation, when a side of the manifold has a round anchor.
+    round: Option<[RoundAnchorPoint<Real>; MAX_MANIFOLD_POINTS]>,
 }
 
 impl GenericContactConstraintBuilder {
@@ -29,6 +31,7 @@ impl GenericContactConstraintBuilder {
             infos: [CoulombContactPointInfos::default(); MAX_MANIFOLD_POINTS],
             handle1: RigidBodyHandle::invalid(),
             handle2: RigidBodyHandle::invalid(),
+            round: None,
         }
     }
 
@@ -125,6 +128,9 @@ impl GenericContactConstraintBuilder {
         let chunk_j_id = *jacobian_id;
 
         let manifold_points = &manifold.data.solver_contacts;
+        let round_centers = manifold.data.round_anchor_centers;
+        out_builder.round = (round_centers != [None, None])
+            .then(|| [RoundAnchorPoint::default(); MAX_MANIFOLD_POINTS]);
         out_constraint.dir1 = force_dir1;
         out_constraint.im1 = if type1.is_dynamic_or_kinematic() {
             mprops1.effective_inv_mass
@@ -368,6 +374,37 @@ impl GenericContactConstraintBuilder {
                 restitution_seed,
             };
 
+            if let Some(round) = out_builder.round.as_mut() {
+                // A round side keeps its world offset from the ball's centre; the centre rides
+                // in the same frame as the body-fixed anchor.
+                let side = |center: Option<Vector>, local_p: Vector, world_point: Vector, frame| {
+                    let (is_multibody, solver_vel, rb) = frame;
+                    match center {
+                        Some(center) => (
+                            local_point(is_multibody, solver_vel, rb, center),
+                            world_point - center,
+                        ),
+                        None => (local_p, Vector::ZERO),
+                    }
+                };
+                let (local1, arm1) = side(
+                    round_centers[0],
+                    infos.local_p1,
+                    point,
+                    (multibody1.is_some(), solver_vel1, *rb1),
+                );
+                let (local2, arm2) = side(
+                    round_centers[1],
+                    infos.local_p2,
+                    point2,
+                    (multibody2.is_some(), solver_vel2, *rb2),
+                );
+                round[k] = RoundAnchorPoint {
+                    local: [local1, local2],
+                    arm: [arm1, arm2],
+                };
+            }
+
             out_builder.handle1 = handle1;
             out_builder.handle2 = handle2;
             out_builder.infos[k] = infos;
@@ -454,15 +491,24 @@ impl GenericContactConstraintBuilder {
         ];
 
         let dir1_na = constraint.dir1;
-        for ((info, normal_part), tangent_part) in all_infos
+        for (k, ((info, normal_part), tangent_part)) in all_infos
             .iter()
             .zip(normal_parts.iter_mut())
             .zip(tangent_parts.iter_mut())
+            .enumerate()
         {
             // Tangent velocity is equivalent to the first body's surface moving artificially.
             let p1 = pose1 * info.local_p1 + info.tangent_vel * solved_dt;
             let p2 = pose2 * info.local_p2;
-            let dist = info.dist + (p1 - p2).gdot(dir1_na);
+            let dist = match &self.round {
+                None => info.dist + (p1 - p2).gdot(dir1_na),
+                Some(round) => {
+                    let round = &round[k];
+                    let p1 = pose1 * round.local[0] + round.arm[0] + info.tangent_vel * solved_dt;
+                    let p2 = pose2 * round.local[1] + round.arm[1];
+                    info.dist + (p1 - p2).gdot(dir1_na)
+                }
+            };
 
             // Normal part.
             {
