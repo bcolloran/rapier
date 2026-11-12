@@ -23,6 +23,18 @@ bitflags::bitflags! {
         /// account for force computation between two rigid colliders.
         const COMPUTE_RIGID_IMPULSES = 0b001;
         // TODO: add a COMPUTE_SOFT_IMPULSES flag too?
+        /// The first collider's side tracks its contacts from its ball's centre through the substeps ([`SubstepContactTracking::CurvatureCenter`](crate::geometry::SubstepContactTracking::CurvatureCenter)). Set by the narrow phase at every full contact update.
+        #[cfg(feature = "substep-contact-tracking")]
+        const CURVATURE_CENTER1 = 0b0010;
+        /// The second collider's side tracks its contacts from its ball's centre.
+        #[cfg(feature = "substep-contact-tracking")]
+        const CURVATURE_CENTER2 = 0b0100;
+        /// The first collider's side tracks its contacts to first order ([`SubstepContactTracking::FirstOrder`](crate::geometry::SubstepContactTracking::FirstOrder)).
+        #[cfg(feature = "substep-contact-tracking")]
+        const FIRST_ORDER1 = 0b1000;
+        /// The second collider's side tracks its contacts to first order.
+        #[cfg(feature = "substep-contact-tracking")]
+        const FIRST_ORDER2 = 0b1_0000;
     }
 }
 
@@ -775,9 +787,6 @@ pub struct ContactManifoldData {
     /// The effective restitution coefficient of this manifold's contacts.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub restitution: Real,
-    /// For each side whose collider uses [`ContactAnchor::Round`](crate::geometry::ContactAnchor::Round), its ball's world-space centre at this manifold's last full contact update; `None` for a body-fixed side. The solver measures that side's separation from a point that keeps its offset from this centre.
-    #[cfg_attr(feature = "serde-serialize", serde(default))]
-    pub round_anchor_centers: [Option<Vector>; 2],
 }
 
 /// A *budgeted* adhesion request: a fixed total adhesion force shared by every manifold enrolled
@@ -1038,7 +1047,6 @@ impl ContactManifoldData {
             adhesion_budget: None,
             friction: 0.0,
             restitution: 0.0,
-            round_anchor_centers: [None; 2],
         }
     }
 

@@ -52,6 +52,9 @@ pub(crate) struct ContactWithTwistFrictionBuilder<N: ScalarType> {
     /// The pair's restitution coefficient (needed by `update` to recompute the
     /// restitution rhs seed).
     restitution: N,
+    /// The lanes' substep contact tracking.
+    #[cfg(feature = "substep-contact-tracking")]
+    tracking: super::substep_tracking_simd::SimdTracking,
 }
 
 impl ContactWithTwistFrictionBuilder<SimdReal> {
@@ -153,6 +156,8 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
         out_constraint.ii2 = poses2.ii;
         out_builder.local_n1 = poses1.rotation.inverse() * force_dir1;
         out_builder.restitution = restitution;
+        #[cfg(feature = "substep-contact-tracking")]
+        out_builder.tracking.begin(&manifolds, [&poses1, &poses2]);
         out_constraint.solver_vel1 = ids1;
         out_constraint.solver_vel2 = ids2;
         out_constraint.manifold_id = manifold_id;
@@ -296,6 +301,18 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
             out_builder.infos[k].local_p2 = poses2.inverse_transform_point(world_com2 + dp2);
             out_builder.infos[k].dist = dist - (point - (world_com2 + dp2)).gdot(force_dir1);
             out_builder.infos[k].restitution_seed = restitution_seed;
+            #[cfg(feature = "substep-contact-tracking")]
+            if out_builder.tracking.active {
+                out_builder.tracking.set_point(
+                    k,
+                    &manifolds,
+                    ks,
+                    [&poses1, &poses2],
+                    p2,
+                    [point, world_com2 + dp2],
+                    [out_builder.infos[k].local_p1, out_builder.infos[k].local_p2],
+                );
+            }
         }
 
         /*
@@ -470,11 +487,26 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
         let solved_dt = SimdReal::splat(solved_dt);
         let tangent_delta = self.tangent_vel * solved_dt;
 
-        for (info, normal_part) in all_infos.iter().zip(normal_parts.iter_mut()) {
+        for (k, (info, normal_part)) in all_infos.iter().zip(normal_parts.iter_mut()).enumerate() {
             // NOTE: the tangent velocity is equivalent to an additional movement of the first body’s surface.
             let p1 = poses1.transform_point(info.local_p1) + tangent_delta;
             let p2 = poses2.transform_point(info.local_p2);
             let dist = info.dist + (p1 - p2).gdot(constraint.dir1);
+            #[cfg(feature = "substep-contact-tracking")]
+            let dist = if self.tracking.active {
+                self.tracking.separation(
+                    k,
+                    [&poses1, &poses2],
+                    constraint.dir1,
+                    info.dist,
+                    tangent_delta,
+                    dist,
+                )
+            } else {
+                dist
+            };
+            #[cfg(not(feature = "substep-contact-tracking"))]
+            let _ = k;
 
             // Normal part.
             {
@@ -540,10 +572,25 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
         let normal_parts = &mut constraint.normal_part[..constraint.num_contacts as usize];
         let tangent_delta = self.tangent_vel * SimdReal::splat(solved_dt);
 
-        for (info, normal_part) in all_infos.iter().zip(normal_parts.iter_mut()) {
+        for (k, (info, normal_part)) in all_infos.iter().zip(normal_parts.iter_mut()).enumerate() {
             let p1 = poses1.transform_point(info.local_p1) + tangent_delta;
             let p2 = poses2.transform_point(info.local_p2);
             let dist = info.dist + (p1 - p2).gdot(constraint.dir1);
+            #[cfg(feature = "substep-contact-tracking")]
+            let dist = if self.tracking.active {
+                self.tracking.separation(
+                    k,
+                    [&poses1, &poses2],
+                    constraint.dir1,
+                    info.dist,
+                    tangent_delta,
+                    dist,
+                )
+            } else {
+                dist
+            };
+            #[cfg(not(feature = "substep-contact-tracking"))]
+            let _ = k;
             // See `update`: the restitution seed is applied by `apply_restitution`, not here.
             normal_part.rhs = dist.simd_max(SimdReal::zero()) * inv_dt;
             normal_part.cfm_factor = SimdReal::splat(1.0);

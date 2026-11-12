@@ -13,10 +13,6 @@ pub use self::collider_handle::ColliderHandle;
 #[cfg(feature = "alloc")]
 pub use self::collider_set::{ColliderSet, ModifiedColliders};
 #[cfg(feature = "alloc")]
-pub(crate) use self::contact_anchor::round_anchor_center;
-#[cfg(feature = "alloc")]
-pub use self::contact_anchor::{ContactAnchor, RoundAnchorNeedsBall};
-#[cfg(feature = "alloc")]
 pub(crate) use self::contact_pair::ContactRecycleState;
 #[cfg(feature = "alloc")]
 pub(crate) use self::contact_pair::PairEventStatus;
@@ -30,6 +26,10 @@ pub use self::contact_pair::{
     NEW_CONTACT_BIT, PairContacts, RigidPairContacts, SimdSolverContact, SolverContact,
     SolverContactGeneric, SolverContacts, SolverFlags, is_bouncy, is_bouncy_simd,
 };
+#[cfg(all(feature = "alloc", feature = "substep-contact-tracking"))]
+pub use self::substep_contact_tracking::{CurvatureCenterNeedsBall, SubstepContactTracking};
+#[cfg(all(feature = "alloc", feature = "substep-contact-tracking"))]
+pub(crate) use self::substep_contact_tracking::{TRACKING_BITS, pair_tracking_flags};
 #[cfg(feature = "alloc")]
 pub(crate) mod contact_patch;
 #[cfg(feature = "alloc")]
@@ -311,9 +311,9 @@ mod collider;
 #[cfg(feature = "alloc")]
 mod collider_set;
 #[cfg(feature = "alloc")]
-mod contact_anchor;
-#[cfg(feature = "alloc")]
 mod mesh_converter;
+#[cfg(all(feature = "alloc", feature = "substep-contact-tracking"))]
+mod substep_contact_tracking;
 
 #[cfg(all(feature = "dim3", feature = "alloc"))]
 mod manifold_reduction;

@@ -4,12 +4,17 @@ use rapier2d::prelude::*;
 
 pub const RADIUS: Real = 0.3;
 
+/// How far an [`BallBody::OffCentre`] ball sits from its body's origin, m.
+pub const OFF_CENTRE: Real = 0.2;
+
 /// How the ball is simulated: its contacts take the rigid-body or the multibody (generic) constraint path.
 #[derive(Copy, Clone, Debug)]
 pub enum BallBody {
     Rigid,
     /// A wheel on a revolute joint under a torso that translates freely and cannot rotate, as the game's wheeled player.
     MultibodyWheel,
+    /// A rigid body whose ball is [`OFF_CENTRE`] to the right of the body's origin, with an extra point mass at the origin, so the centre of mass lies between them. Its `spin` turns it about the ball's centre: the centre of mass moves round it, the ball spins in place.
+    OffCentre,
 }
 
 /// The fixed surfaces under the ball. Each is a set of half-planes `(point, outward normal)`, one manifold each.
@@ -51,6 +56,8 @@ pub struct World {
     pub gravity: Vector,
     pub ball: RigidBodyHandle,
     wheel_joint: Option<MultibodyJointHandle>,
+    /// The ball's centre in its body's frame.
+    offset: Vector,
 }
 
 impl World {
@@ -58,7 +65,7 @@ impl World {
     pub fn new(
         body: BallBody,
         surface: Surface,
-        anchor: ContactAnchor,
+        tracking: SubstepContactTracking,
         center: Vector,
         velocity: Vector,
         spin: Real,
@@ -78,23 +85,40 @@ impl World {
                 &mut bodies,
             );
         }
-        let ball = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(center)
-                .linvel(velocity)
-                .angvel(spin)
-                .can_sleep(false),
-        );
+        let offset = match body {
+            BallBody::OffCentre => Vector::X * OFF_CENTRE,
+            _ => Vector::ZERO,
+        };
+        let mut ball_body = RigidBodyBuilder::dynamic()
+            .translation(center - offset)
+            .linvel(velocity)
+            .angvel(spin)
+            .can_sleep(false);
+        if let BallBody::OffCentre = body {
+            ball_body =
+                ball_body.additional_mass_properties(MassProperties::new(Vector::ZERO, 200.0, 1.0));
+        }
+        let ball = bodies.insert(ball_body);
         let ball_collider = ColliderBuilder::ball(RADIUS)
+            .translation(offset)
             .friction(0.0)
             .density(1000.0)
-            .contact_anchor(anchor)
-            .expect("a ball takes any contact anchor");
+            .substep_contact_tracking(tracking)
+            .expect("a ball takes any substep contact tracking");
         colliders.insert_with_parent(ball_collider, ball, &mut bodies);
+        if let BallBody::OffCentre = body {
+            // The centre of mass circles the ball's centre: its velocity is the spin's at its offset from that centre, plus the ball's own.
+            let rb = &mut bodies[ball];
+            let from_center = rb.center_of_mass() - center;
+            rb.set_linvel(
+                velocity + Vector::new(-from_center.y, from_center.x) * spin,
+                true,
+            );
+        }
 
         let mut multibody_joints = MultibodyJointSet::new();
         let wheel_joint = match body {
-            BallBody::Rigid => None,
+            BallBody::Rigid | BallBody::OffCentre => None,
             BallBody::MultibodyWheel => {
                 let root = bodies.insert(RigidBodyBuilder::fixed().translation(center));
                 let torso = bodies.insert(
@@ -127,6 +151,7 @@ impl World {
             gravity: Vector::new(0.0, -9.81),
             ball,
             wheel_joint,
+            offset,
         };
         world.set_multibody_velocity(velocity, spin);
         world
@@ -174,7 +199,9 @@ impl World {
     }
 
     pub fn center(&self) -> Vector {
-        self.bodies[self.ball].translation()
+        self.bodies[self.ball]
+            .position()
+            .transform_point(self.offset)
     }
 
     /// The ball's true gap to the nearest plane of `surface`, negative when it overlaps.

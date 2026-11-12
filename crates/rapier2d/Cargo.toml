@@ -77,6 +77,11 @@ serde-serialize = [
 ]
 enhanced-determinism = ["simba/libm_force", "parry2d/enhanced-determinism"]
 debug-render = []
+# Lets a collider choose how the solver moves its side of a contact through the substeps
+# (`SubstepContactTracking`): body-fixed (the default and the only behaviour without the
+# feature), from a ball's curvature centre, or to first order in the body's motion. Off, the
+# crate compiles to exactly what it is without it.
+substep-contact-tracking = []
 profiler = ["dep:web-time"] # Enables the internal profiler.
 bytemuck = ["dep:bytemuck"]
 

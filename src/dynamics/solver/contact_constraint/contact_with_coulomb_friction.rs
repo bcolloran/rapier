@@ -1,4 +1,4 @@
-use super::{ContactConstraintNormalPart, ContactConstraintTangentPart, RoundAnchorPoint};
+use super::{ContactConstraintNormalPart, ContactConstraintTangentPart};
 #[cfg(feature = "block-solver")]
 use crate::dynamics::solver::contact_constraint::BLOCK_SOLVER_MIN_CONDITION;
 use crate::dynamics::solver::manifold_store::ManifoldStore;
@@ -46,12 +46,37 @@ pub(crate) struct ContactWithCoulombFrictionBuilder {
     /// The pair's restitution coefficient (needed by `update` to recompute the
     /// restitution rhs seed).
     restitution: SimdReal,
-    /// Whether any lane has a round-anchor side; when false, `round_lanes` and `round` are stale and unread.
-    has_round: bool,
-    /// 1 on lanes with a round-anchor side, 0 elsewhere.
-    round_lanes: SimdReal,
-    /// The anchors of the round separation, read on the lanes of `round_lanes`.
-    round: [RoundAnchorPoint<SimdReal>; MAX_MANIFOLD_POINTS],
+    /// The lanes' substep contact tracking.
+    #[cfg(feature = "substep-contact-tracking")]
+    tracking: super::substep_tracking_simd::SimdTracking,
+}
+
+impl ContactWithCoulombFrictionBuilder {
+    /// Point `k`'s separation `dist`, measured instead from the tracked points on lanes with a tracked side (see `substep_tracking`).
+    #[inline(always)]
+    fn tracked_separation(
+        &self,
+        k: usize,
+        poses: [&SolverTransform<SimdReal>; 2],
+        dir1: <SimdReal as ScalarType>::Vector,
+        info: &CoulombContactPointInfos<SimdReal>,
+        solved_dt: SimdReal,
+        dist: SimdReal,
+    ) -> SimdReal {
+        #[cfg(feature = "substep-contact-tracking")]
+        if self.tracking.active {
+            return self.tracking.separation(
+                k,
+                poses,
+                dir1,
+                info.dist,
+                info.tangent_vel * solved_dt,
+                dist,
+            );
+        }
+        let _ = (k, poses, dir1, info, solved_dt);
+        dist
+    }
 }
 
 impl ContactWithCoulombFrictionBuilder {
@@ -154,26 +179,8 @@ impl ContactWithCoulombFrictionBuilder {
         out_constraint.num_contacts = num_points as u8;
         out_builder.local_n1 = poses1.rotation.inverse() * force_dir1;
         out_builder.restitution = restitution;
-        out_builder.has_round = manifolds
-            .iter()
-            .any(|m| m.data.round_anchor_centers != [None, None]);
-        // Each side's ball centre (zero on body-fixed lanes) and a 0/1 mask of its round lanes.
-        let round_side = |side: usize| {
-            let center = <SimdReal as ScalarType>::Vector::from(gather![|ii| manifolds[ii]
-                .data
-                .round_anchor_centers[side]
-                .unwrap_or_default()
-                .into()]);
-            let mask = SimdReal::from(gather![
-                |ii| manifolds[ii].data.round_anchor_centers[side].is_some() as u32 as Real
-            ]);
-            (center, mask)
-        };
-        let (round_center1, round_mask1) = round_side(0);
-        let (round_center2, round_mask2) = round_side(1);
-        out_builder.round_lanes = (round_mask1 + round_mask2).simd_min(SimdReal::splat(1.0));
-        let round_center_local1 = poses1.inverse_transform_point(round_center1);
-        let round_center_local2 = poses2.inverse_transform_point(round_center2);
+        #[cfg(feature = "substep-contact-tracking")]
+        out_builder.tracking.begin(&manifolds, [&poses1, &poses2]);
         #[cfg(feature = "dim3")]
         {
             out_constraint.tangent1 = tangents1[0];
@@ -338,35 +345,17 @@ impl ContactWithCoulombFrictionBuilder {
             out_builder.infos[k].dist =
                 dist - ((world_com1 + dp1) - (world_com2 + dp2)).gdot(force_dir1);
             out_builder.infos[k].restitution_seed = restitution_seed;
-
-            if out_builder.has_round {
-                // A round side keeps its world offset from the ball's centre, the centre riding
-                // in the side's CoM frame; a body-fixed side keeps its anchor with a zero offset.
-                let one = SimdReal::splat(1.0);
-                let side = |center_local, center, mask: SimdReal, local_p, world_point| {
-                    (
-                        center_local * mask + local_p * (one - mask),
-                        (world_point - center) * mask,
-                    )
-                };
-                let (local1, arm1) = side(
-                    round_center_local1,
-                    round_center1,
-                    round_mask1,
-                    out_builder.infos[k].local_p1,
-                    world_com1 + dp1,
+            #[cfg(feature = "substep-contact-tracking")]
+            if out_builder.tracking.active {
+                out_builder.tracking.set_point(
+                    k,
+                    &manifolds,
+                    ks,
+                    [&poses1, &poses2],
+                    p2,
+                    [world_com1 + dp1, world_com2 + dp2],
+                    [out_builder.infos[k].local_p1, out_builder.infos[k].local_p2],
                 );
-                let (local2, arm2) = side(
-                    round_center_local2,
-                    round_center2,
-                    round_mask2,
-                    out_builder.infos[k].local_p2,
-                    world_com2 + dp2,
-                );
-                out_builder.round[k] = RoundAnchorPoint {
-                    local: [local1, local2],
-                    arm: [arm1, arm2],
-                };
             }
         }
 
@@ -467,13 +456,14 @@ impl ContactWithCoulombFrictionBuilder {
             // NOTE: the tangent velocity is equivalent to an additional movement of the first body’s surface.
             let p1 = poses1.transform_point(info.local_p1) + info.tangent_vel * solved_dt;
             let p2 = poses2.transform_point(info.local_p2);
-            let dist = self.separation(
+            let dist = info.dist + (p1 - p2).gdot(constraint.dir1);
+            let dist = self.tracked_separation(
                 k,
-                info,
-                [p1, p2],
                 [&poses1, &poses2],
                 constraint.dir1,
+                info,
                 solved_dt,
+                dist,
             );
 
             // Normal part.
@@ -518,29 +508,6 @@ impl ContactWithCoulombFrictionBuilder {
         constraint.cfm_factor = cfm_factor;
     }
 
-    /// The separation of point `k`, whose body-fixed anchors are at `points`: measured from its round anchors on the lanes with a round side, from `points` elsewhere.
-    #[inline]
-    fn separation(
-        &self,
-        k: usize,
-        info: &CoulombContactPointInfos<SimdReal>,
-        points: [<SimdReal as ScalarType>::Vector; 2],
-        poses: [&SolverTransform<SimdReal>; 2],
-        dir1: <SimdReal as ScalarType>::Vector,
-        solved_dt: SimdReal,
-    ) -> SimdReal {
-        let dist = info.dist + (points[0] - points[1]).gdot(dir1);
-        if !self.has_round {
-            return dist;
-        }
-        let round = &self.round[k];
-        let p1 =
-            poses[0].transform_point(round.local[0]) + round.arm[0] + info.tangent_vel * solved_dt;
-        let p2 = poses[1].transform_point(round.local[1]) + round.arm[1];
-        let round_dist = info.dist + (p1 - p2).gdot(dir1);
-        round_dist.select(self.round_lanes.simd_gt(SimdReal::zero()), dist)
-    }
-
     /// Relax-pass update: recompute the unbiased rhs (speculative term included)
     /// from the CURRENT solver poses and strip softness and penetration bias. See
     /// `ContactWithTwistFrictionBuilder::update_rhs_wo_bias` for why stale separations are unusable.
@@ -567,13 +534,14 @@ impl ContactWithCoulombFrictionBuilder {
         {
             let p1 = poses1.transform_point(info.local_p1) + info.tangent_vel * solved_dt;
             let p2 = poses2.transform_point(info.local_p2);
-            let dist = self.separation(
+            let dist = info.dist + (p1 - p2).gdot(constraint.dir1);
+            let dist = self.tracked_separation(
                 k,
-                info,
-                [p1, p2],
                 [&poses1, &poses2],
                 constraint.dir1,
+                info,
                 solved_dt,
+                dist,
             );
             // See `update`: the restitution seed is applied by `apply_restitution`, not here.
             normal_part.rhs = dist.simd_max(SimdReal::zero()) * inv_dt;

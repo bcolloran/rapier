@@ -121,14 +121,8 @@ pub(super) fn process_pair(
                 | ColliderChanges::POSITION
                 | ColliderChanges::LOCAL_MASS_PROPERTIES;
             let hooks_involved = !(co1.flags.active_hooks | co2.flags.active_hooks).is_empty();
-            // A pair whose collider took a round anchor since its last full update.
-            let round_involved = crate::geometry::round_anchor_center(co1).is_some()
-                || crate::geometry::round_anchor_center(co2).is_some();
 
-            if ((co1.changes | co2.changes) & !recycle_safe).is_empty()
-                && !hooks_involved
-                && !round_involved
-            {
+            if ((co1.changes | co2.changes) & !recycle_safe).is_empty() && !hooks_involved {
                 let pos12 = co1.pos.inv_mul(&co2.pos);
                 // Conservative bound on how far any contact point moved in
                 // the pair's local space since the last full update (chord
@@ -313,6 +307,12 @@ pub(super) fn process_pair(
         if !co1.flags.solver_groups.test(co2.flags.solver_groups) {
             solver_flags.remove(SolverFlags::COMPUTE_RIGID_IMPULSES);
         }
+
+        // Each side's substep contact tracking. Its collider bits sit in the hook flags, so a pair
+        // with a tracked side never recycles: the solver derives a tracked side's motion from
+        // this step's detection.
+        #[cfg(feature = "substep-contact-tracking")]
+        solver_flags.insert(crate::geometry::pair_tracking_flags(co1, co2));
 
         // Contacts with a soft body (its surface) are solved by the
         // soft-body solver (as constraints over the touched particles), never by the rigid contact
@@ -526,11 +526,6 @@ pub(super) fn process_pair(
             &mut rigid.manifolds
         };
 
-        let round_anchor_centers = [
-            crate::geometry::round_anchor_center(co1),
-            crate::geometry::round_anchor_center(co2),
-        ];
-
         for manifold in solver_manifolds {
             let world_pos1 = manifold.subshape_pos1().prepend_to(&co1.pos);
             let world_pos2 = manifold.subshape_pos2().prepend_to(&co2.pos);
@@ -540,7 +535,6 @@ pub(super) fn process_pair(
             manifold.data.solver_flags = solver_flags;
             manifold.data.friction = friction;
             manifold.data.restitution = restitution;
-            manifold.data.round_anchor_centers = round_anchor_centers;
             manifold.data.relative_dominance =
                 dominance1.effective_group(&rb_type1) - dominance2.effective_group(&rb_type2);
             manifold.data.normal = world_pos1.rotation * manifold.local_n1;
@@ -731,12 +725,7 @@ pub(super) fn process_pair(
         // subsequent steps can recycle the pair while it stays close to it.
         // Hook-modified contacts must be rebuilt when the hook is removed, so
         // transient requests (including adhesion) cannot survive through recycling.
-        // A round anchor is re-detected every step: a recycled contact would carry the
-        // ball's rotation since the last full update into its separation.
-        if contact_recycle_distance > 0.0
-            && active_hooks.is_empty()
-            && round_anchor_centers == [None, None]
-        {
+        if contact_recycle_distance > 0.0 && active_hooks.is_empty() {
             // Computing the local AABBs goes through a dyn Shape call per
             // collider per full update; the extents only change when a
             // shape does, so reuse the previous full update's value.

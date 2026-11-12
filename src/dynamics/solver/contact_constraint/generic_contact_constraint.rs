@@ -6,7 +6,7 @@ use crate::math::TangentImpulse;
 use crate::math::{DIM, DVector, MAX_MANIFOLD_POINTS, Real};
 use crate::utils::{self, AngularInertiaOps, CrossProduct, DotProduct};
 
-use super::{ContactConstraintNormalPart, ContactConstraintTangentPart, RoundAnchorPoint};
+use super::{ContactConstraintNormalPart, ContactConstraintTangentPart};
 use crate::dynamics::solver::CoulombContactPointInfos;
 use crate::dynamics::solver::manifold_store::ManifoldStore;
 use crate::dynamics::solver::solver_body::SolverBodies;
@@ -21,8 +21,9 @@ pub(crate) struct GenericContactConstraintBuilder {
     infos: [CoulombContactPointInfos<Real>; MAX_MANIFOLD_POINTS],
     handle1: RigidBodyHandle,
     handle2: RigidBodyHandle,
-    /// The anchors of the round separation, when a side of the manifold has a round anchor.
-    round: Option<[RoundAnchorPoint<Real>; MAX_MANIFOLD_POINTS]>,
+    /// The substep tracking of a manifold with a tracked side; `None` when both sides are body-fixed.
+    #[cfg(feature = "substep-contact-tracking")]
+    tracking: Option<super::substep_tracking::ScalarTracking>,
 }
 
 impl GenericContactConstraintBuilder {
@@ -31,7 +32,8 @@ impl GenericContactConstraintBuilder {
             infos: [CoulombContactPointInfos::default(); MAX_MANIFOLD_POINTS],
             handle1: RigidBodyHandle::invalid(),
             handle2: RigidBodyHandle::invalid(),
-            round: None,
+            #[cfg(feature = "substep-contact-tracking")]
+            tracking: None,
         }
     }
 
@@ -128,9 +130,34 @@ impl GenericContactConstraintBuilder {
         let chunk_j_id = *jacobian_id;
 
         let manifold_points = &manifold.data.solver_contacts;
-        let round_centers = manifold.data.round_anchor_centers;
-        out_builder.round = (round_centers != [None, None])
-            .then(|| [RoundAnchorPoint::default(); MAX_MANIFOLD_POINTS]);
+        // Each side's anchor frame at the build, as `local_point` below resolves it.
+        #[cfg(feature = "substep-contact-tracking")]
+        let tracking_frames = {
+            use crate::math::Pose;
+            let frame = |is_multibody: bool, solver_vel: u32, rb: &crate::dynamics::RigidBody| {
+                if is_multibody {
+                    rb.pos.position
+                } else if solver_vel != u32::MAX {
+                    Pose::from_parts(rb.mprops.world_com, rb.pos.position.rotation)
+                } else {
+                    Pose::IDENTITY
+                }
+            };
+            [
+                frame(multibody1.is_some(), solver_vel1, rb1),
+                frame(multibody2.is_some(), solver_vel2, rb2),
+            ]
+        };
+        #[cfg(feature = "substep-contact-tracking")]
+        {
+            use super::substep_tracking::{ScalarTracking, SideTracking, any_tracked};
+            let flags = manifold.data.solver_flags;
+            out_builder.tracking = any_tracked(flags).then(|| ScalarTracking {
+                kinds: [SideTracking::of(flags, 0), SideTracking::of(flags, 1)],
+                rotations0: [tracking_frames[0].rotation, tracking_frames[1].rotation],
+                points: [Default::default(); MAX_MANIFOLD_POINTS],
+            });
+        }
         out_constraint.dir1 = force_dir1;
         out_constraint.im1 = if type1.is_dynamic_or_kinematic() {
             mprops1.effective_inv_mass
@@ -374,35 +401,17 @@ impl GenericContactConstraintBuilder {
                 restitution_seed,
             };
 
-            if let Some(round) = out_builder.round.as_mut() {
-                // A round side keeps its world offset from the ball's centre; the centre rides
-                // in the same frame as the body-fixed anchor.
-                let side = |center: Option<Vector>, local_p: Vector, world_point: Vector, frame| {
-                    let (is_multibody, solver_vel, rb) = frame;
-                    match center {
-                        Some(center) => (
-                            local_point(is_multibody, solver_vel, rb, center),
-                            world_point - center,
-                        ),
-                        None => (local_p, Vector::ZERO),
-                    }
-                };
-                let (local1, arm1) = side(
-                    round_centers[0],
-                    infos.local_p1,
-                    point,
-                    (multibody1.is_some(), solver_vel1, *rb1),
+            #[cfg(feature = "substep-contact-tracking")]
+            if let Some(tracking) = out_builder.tracking.as_mut() {
+                tracking.points[k] = super::substep_tracking::tracked_point(
+                    tracking.kinds,
+                    manifold,
+                    manifold_point,
+                    p2,
+                    tracking_frames,
+                    [infos.local_p1, infos.local_p2],
+                    [point, point2],
                 );
-                let (local2, arm2) = side(
-                    round_centers[1],
-                    infos.local_p2,
-                    point2,
-                    (multibody2.is_some(), solver_vel2, *rb2),
-                );
-                round[k] = RoundAnchorPoint {
-                    local: [local1, local2],
-                    arm: [arm1, arm2],
-                };
             }
 
             out_builder.handle1 = handle1;
@@ -500,15 +509,19 @@ impl GenericContactConstraintBuilder {
             // Tangent velocity is equivalent to the first body's surface moving artificially.
             let p1 = pose1 * info.local_p1 + info.tangent_vel * solved_dt;
             let p2 = pose2 * info.local_p2;
-            let dist = match &self.round {
-                None => info.dist + (p1 - p2).gdot(dir1_na),
-                Some(round) => {
-                    let round = &round[k];
-                    let p1 = pose1 * round.local[0] + round.arm[0] + info.tangent_vel * solved_dt;
-                    let p2 = pose2 * round.local[1] + round.arm[1];
+            let dist = info.dist + (p1 - p2).gdot(dir1_na);
+            // A tracked side measures from its tracked point (see `substep_tracking`).
+            #[cfg(feature = "substep-contact-tracking")]
+            let dist = match &self.tracking {
+                None => dist,
+                Some(tracking) => {
+                    let p1 = tracking.point(k, 0, &pose1) + info.tangent_vel * solved_dt;
+                    let p2 = tracking.point(k, 1, &pose2);
                     info.dist + (p1 - p2).gdot(dir1_na)
                 }
             };
+            #[cfg(not(feature = "substep-contact-tracking"))]
+            let _ = k;
 
             // Normal part.
             {

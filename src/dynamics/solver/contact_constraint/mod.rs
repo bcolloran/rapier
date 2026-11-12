@@ -5,7 +5,6 @@ pub(crate) use contact_constraints_set::{
 pub(crate) use contact_with_coulomb_friction::*;
 pub(crate) use generic_contact_constraint::*;
 pub(crate) use generic_contact_constraint_element::*;
-pub(crate) use round_anchor::RoundAnchorPoint;
 
 #[cfg(feature = "dim3")]
 pub(crate) use contact_with_twist_friction::*;
@@ -15,7 +14,10 @@ mod contact_constraints_set;
 mod contact_with_coulomb_friction;
 mod generic_contact_constraint;
 mod generic_contact_constraint_element;
-mod round_anchor;
+#[cfg(feature = "substep-contact-tracking")]
+mod substep_tracking;
+#[cfg(feature = "substep-contact-tracking")]
+mod substep_tracking_simd;
 
 #[cfg(feature = "dim3")]
 mod contact_with_twist_friction;
